@@ -3,6 +3,13 @@
 One entry per kit version an instance can be made at. An instance records its kit commit in `KIT-VERSION` and is upgraded
 only by a methods session with a diff against that commit, never automatically (operator ruling, 2026-09-22).
 
+## kit-v0.6.32 — 2026-10-03 — the README's configuration section
+
+The user: "can we include a blurb about configuration in the public readme?". README.md gains a Configuration section
+(the environment file, routes, run limits, settings templates), linking the configuration reference. The reference's
+two passages on how a model name finds its family still said a word counts when the name begins with it, wrong since
+`kit-v0.6.22`; both now say a whole part of the name, or one followed by a digit. No tool or test changed.
+
 ## kit-v0.6.31 — 2026-10-03 — P-16; the README's diagram; the review for ud
 
 - **P-16** (found reviewing the kit's changes for the source; the user: "now fix p16"): a networked Claude worker loads

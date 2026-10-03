@@ -45,8 +45,9 @@ that writes a file or runs a program); the Read tool may read it. The same holds
   root, a home directory, `/home` or a directory holding a home, a credential directory, the instance or anything inside
   or holding it.
 - **`model_families`**: `{"Family": ["word", …]}`, added after the built-in Anthropic and OpenAI words. A model's family
-  is the first family, built-in ones first, one of whose words is a part of the model's name (split at every character
-  that is not a letter or digit) or begins it. The family decides the cross-family referee rule
+  is the first family, built-in ones first, one of whose words is a whole part of the model's name (split at every
+  character that is not a letter or digit), or begins a part and is followed there by a digit (`gpt5`, `opus4`); never
+  any other prefix (`kit-v0.6.22`). The family decides the cross-family referee rule
   ([RULES.md §7](../../RULES.md#7-standing-rules-that-keep-cycles-convergent)): the read counts from any known family
   other than the producer's, an added one included (`bin/_lib.py`, `cross_family_need`; since `kit-v0.6.7`). An added
   family is not covered by §7's exception for reads before their ladders, which names the two built-in families: its
@@ -353,7 +354,7 @@ enabled route runs one family. The flags below are each route's canary flags as 
 A model's family is read from its name (`bin/_env.py`, `model_family`, through `bin/_lib.py`): Anthropic for `anthropic`,
 `opus`, `fable`, `sonnet`, `haiku`, `claude`; OpenAI for `openai`, `gpt`, `sol`, `astra`, `codex`; then any family
 `kit-env.json`'s `model_families` adds ([above](#the-fields)); otherwise unknown. A word counts when it is one of the
-name's parts between characters that are not letters or digits, or when the name begins with it
+name's parts between characters that are not letters or digits, or begins a part and is followed there by a digit
 ([SCHEMAS.md §4](../../SCHEMAS.md#4-earned-tag--binmerge-computes-binledger-claims-enforces)).
 
 ### `bin/run-external` flags

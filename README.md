@@ -44,6 +44,26 @@ made it, in [LESSONS.md](LESSONS.md): the kit's design rationale, written as a r
 
 Then [a full cycle](docs/guides/a-full-cycle.md) takes a claim from a solver run to the ledger.
 
+## Configuration
+
+An instance is configured by a few files at its root. They are yours: you edit them by hand, and the hook refuses the
+orchestrator any write to them.
+
+- **`kit-env.json`, the environment file**: what workers get beyond the system. *Modules* are programs mounted read-only
+  with their `PATH` and environment, such as a Lean library or PARI/GP; a module that names licence servers reaches
+  them only in a run launched with that module. The file also sets extra directories for every worker's `PATH`, which
+  Claude Code and Codex CLIs to use, extra model families, and where the locked answer keys live. Give it to a new
+  instance with `bin/new-workspace --env FILE`, and run `bin/check-env` after every change.
+- **Routes** (`bin/new-workspace --routes`, default `anthropic,codex`): which providers launch workers, with or without
+  the network. The default is one route per model family, because a proved or scripted claim needs a referee from the
+  other family.
+- **Run limits**: each run's CPU hours, threads and memory, set by `bin/new-run --cpu-hours --threads --mem-gb` and
+  enforced on the worker's whole process tree.
+- **Settings**: the Claude Code settings are templates in `.claude/`, filled in for the instance by `bin/new-workspace`.
+  Never copy a live settings file between trees.
+
+Every field and default: [configuration](docs/reference/configuration.md).
+
 ## Documentation
 
 [docs/index.md](docs/index.md) is the map. In short:
