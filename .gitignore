@@ -1,0 +1,19 @@
+.claude/state/
+__pycache__/
+*.pyc
+lean/.lake/
+.ledger-outbox
+transcripts/
+
+# API keys for the orchestrator only; never committed
+.env.*
+
+# Claude Code's per-user permission rules ("don't ask again" writes them): never committed, never carried with a copy
+# of the tree; RULES.md section 9, settings are templates, never live
+.claude/settings.local.json
+
+# A third-party source an instance clones for reading (its own .git): pin it by commit in the problem's
+# prior-art register, ignore it here, and name its prefix in .verify-data-skip. One line per clone.
+
+# Method change 25: what a networked worker downloads is hashed in RUN/RECORD-EXT.md, not committed
+workspace-*/runs/*/downloads/

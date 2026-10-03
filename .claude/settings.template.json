@@ -1,0 +1,125 @@
+{
+  "permissions": {
+    "deny": [
+      "WebFetch",
+      "WebSearch",
+      "mcp__claude_ai_Gmail",
+      "mcp__claude_ai_Google_Calendar",
+      "mcp__claude_ai_Google_Drive",
+      "mcp__qmd",
+      "Bash(curl:*)",
+      "Bash(wget:*)"
+    ]
+  },
+  "deniedMcpServers": [
+    {"serverName": "qmd"},
+    {"serverUrl": "https://*"},
+    {"serverUrl": "http://*"}
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 @ROOT@/.claude/hooks/sandbox.py",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location(\"kit_hook_check\", sys.argv[1]); s.loader.exec_module(u.module_from_spec(s))' @ROOT@/.claude/hooks/sandbox.py < /dev/null || { echo 'kit hook: .claude/hooks/sandbox.py does not load; every call is refused until it does (P-11 (d))' >&2; exit 2; }",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 @ROOT@/.claude/hooks/sandbox.py",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 @ROOT@/.claude/hooks/sandbox.py",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 @ROOT@/.claude/hooks/sandbox.py",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@ROOT@/.claude/hooks/mirror-transcripts.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@ROOT@/.claude/hooks/mirror-transcripts.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@ROOT@/.claude/hooks/mirror-transcripts.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "@ROOT@/.claude/hooks/mirror-transcripts.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  },
+  "claudeMdExcludes": [
+    "@HOME@/CLAUDE.md",
+    "@HOME@/.claude/CLAUDE.md"
+  ],
+  "includeGitInstructions": false,
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "600000",
+    "BASH_MAX_TIMEOUT_MS": "3600000"
+  }
+}

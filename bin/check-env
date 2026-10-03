@@ -1,0 +1,101 @@
+#!/usr/bin/python3
+"""bin/check-env   (read-only; kit-v0.5, the user's "we need to generalize", 2026-10-01)
+
+What this machine offers the kit, one line each: `ok`, `WARN` (works, with a limit) or `FAIL` (a run cannot work).
+  required   python (/usr/bin/python3, 3.9 or newer: the tools', the hook's and the sandbox's interpreter, LESSONS.md
+             "Every tool, hook and test runs on `/usr/bin/python3`"), bwrap (and that it starts a sandbox), GNU time
+             (/usr/bin/time), timeout, git, and the Claude Code CLI (kit-env.json's "claude", default `claude` on PATH)
+  limits     systemd user scope: without it bin/limits-exec refuses to run a worker, so no run can launch (FAIL)
+  optional   rsync (the transcript mirror), the Codex CLI and its real binary (the codex route) (WARN when missing)
+  kit-env.json   every problem bin/_env.py reports (FAIL), then each module: its mounts, and its `check` command run
+             inside a worker's sandbox with the module mounted (FAIL if it exits non-zero; WARN for a licence module,
+             whose check may need its server, which this does not start)
+Exit 1 if any line is FAIL, else 0. Run it after installing, after editing kit-env.json, and in an instance's preflight.
+"""
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _env as E   # noqa: E402
+import _lib as L   # noqa: E402
+
+LINES = []
+
+
+def line(status, item, detail=""):
+    LINES.append(status)
+    print(f"{status:<5} {item}" + (f": {detail}" if detail else ""))
+
+
+def run(argv, timeout=60):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+
+
+def main():
+    root = L.ROOT
+    env = E.load(root)
+    rc, out = run(["/usr/bin/python3", "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
+    ok = rc == 0 and tuple(int(x) for x in out.split(".")[:2]) >= (3, 9)
+    line("ok" if ok else "FAIL", "python", f"/usr/bin/python3 {out}" if rc == 0 else "no /usr/bin/python3")
+    # P-11 (f): the one the sandboxes run (PATH=/usr/bin:/bin in the hook and bin/_ext.py; kit-shell names it), not PATH's
+    bw = "/usr/bin/bwrap" if os.access("/usr/bin/bwrap", os.X_OK) else None
+    rc, out = run([bw, "--ro-bind", "/", "/", "--unshare-all", "--die-with-parent", "true"]) if bw else (None, "")
+    line("ok" if rc == 0 else "FAIL", "bwrap", bw if rc == 0 else (f"{bw} cannot start a sandbox: {out[:160]}" if bw
+                                                                     else "no /usr/bin/bwrap (the bubblewrap package; the sandboxes run that one)"))
+    for item, path in (("GNU time", "/usr/bin/time"), ("timeout", shutil.which("timeout")), ("git", shutil.which("git"))):
+        line("ok" if path and os.path.exists(path) else "FAIL", item, path or "not found")
+    rc, out = run(["systemd-run", "--user", "--scope", "--quiet", "--", "true"]) if shutil.which("systemd-run") else (None, "")
+    line("ok" if rc == 0 else "FAIL", "systemd user scope",
+         "limits are enforced" if rc == 0 else "unavailable: the run's limits cannot be enforced, so bin/run-external refuses every launch")
+    rs = shutil.which("rsync")
+    line("ok" if rs else "WARN", "rsync", rs or "not found: the transcript mirror (.claude/hooks/mirror-transcripts.sh) does nothing")
+    cl = env.claude if os.path.isabs(env.claude) else shutil.which(env.claude)
+    line("ok" if cl and os.path.exists(cl) else "FAIL", "claude", cl or f"{env.claude!r} not found")
+    import _ext
+    cx = env.codex if os.path.isabs(env.codex) else shutil.which(env.codex)
+    bd = _ext.find_codex_bin_dir(env.codex, env.codex_bin_dir, os.environ)
+    line("ok" if bd and os.path.isfile(os.path.join(bd, "codex")) else "WARN", "codex",
+         f"{cx}, real binary in {bd}" if bd else "not found: the codex route is unavailable (optional)")
+    if env.problems:
+        for p in env.problems:
+            line("FAIL", "kit-env.json", p)
+    else:
+        line("ok", "kit-env.json", "present" if os.path.isfile(os.path.join(root, "kit-env.json"))
+             else "absent (defaults; an older instance's .kit-lean / .kit-sage still apply)")
+    if env.modules:
+        hook = os.path.join(root, ".claude", "hooks", "sandbox.py")
+        spec = importlib.util.spec_from_file_location("check_env_hook", hook)
+        H = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(H)
+        rd = tempfile.mkdtemp(prefix="check-env-")
+        try:
+            os.environ["KIT_WORKER_RUN"] = rd
+            os.environ["KIT_WORKER_MODULES"] = ",".join(n for n, m in env.modules.items() if m.on_request)
+            for name, m in sorted(env.modules.items()):
+                mounts = ", ".join(s for s, _ in m.binds) or "no mounts"
+                if not m.check:
+                    line("ok", f"module {name}", f"{mounts}; no check command")
+                    continue
+                p = subprocess.run(H.bwrap_command(rd, m.check), shell=True, capture_output=True, text=True, timeout=300)
+                last = (p.stdout + p.stderr).strip().splitlines()[-1:] or [""]
+                if p.returncode == 0:
+                    line("ok", f"module {name}", f"`{m.check}` in a worker's sandbox: {last[0][:120]}")
+                else:
+                    line("WARN" if m.on_request else "FAIL", f"module {name}",
+                         f"`{m.check}` exited {p.returncode} in a worker's sandbox: {last[0][:120]}"
+                         + (" (a licence module: its server is not reached here)" if m.on_request else ""))
+        finally:
+            shutil.rmtree(rd, ignore_errors=True)
+    return 1 if "FAIL" in LINES else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

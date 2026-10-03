@@ -1,0 +1,185 @@
+#!/usr/bin/python3
+"""bin/ledger-claims RUN ID [ID ...]
+
+RULES.md step 5. Appends the named claims of RUN to CLAIMS.md at the tag they EARNED
+(SCHEMAS.md rules), assigning global ids C-NNN. All-or-nothing: if any named claim is
+FALSIFIED, BLOCKED, PENDING, already ledgered, its artifact hash differs from check.json, it supersedes an id
+not in CLAIMS.md, or it names a `ledger` premise not in CLAIMS.md, nothing is appended and the reasons are printed.
+Per claim it prints, never refusing on them: its model-family line (LESSONS.md "A cross-family certify read"), the notes
+on its id and on what it supersedes, the live entries depending on a superseded one (bin/claim-deps), and a MODEL: line
+for the run and each referee run not answered by the one model its approval named (LESSONS.md "The model a worker ran
+on is recorded").
+An entry with `published`, `source` or `ledger` premises carries `(conditional: …)` in its header (SCHEMAS.md §5).
+
+LESSONS.md "Every launch and every ledger append consumes a byte-bound": refuses (exit 3) unless the user ran `bin/approve --ledger RUN ID…` for exactly
+these ids within 30 minutes and nothing it bound has changed since: claims.json, check.json,
+verdict.md, every live referee.json of these ids, CLAIMS.md. The approval is consumed by the append.
+--operator-approved is still accepted and means nothing: the approval record is the approval.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+import _approval as A
+
+# P-12 H2: every line break a reader might split on; a field's own breaks become spaces, so no field writes a line
+BREAKS = re.compile(r"[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+HEADER = ("# CLAIMS\n\nOne entry per claim, appended by bin/ledger-claims from an approved claims.json. "
+          "Never edited; superseded by a new entry that references the old. Tags per RULES.md.\n")
+
+
+def existing():
+    ids, keys = [], set()
+    if os.path.isfile(L.CLAIMS_MD):
+        for line in open(L.CLAIMS_MD):
+            m = re.match(r"^## (C-\d+)\s+\[[A-Z]+\]\s+\S+\s+run (\S+)/(\S+)", line)  # note headers (C-NNN-note) do not match
+            if m:
+                ids.append(int(m.group(1)[2:]))
+                keys.add((m.group(2), m.group(3)))
+    return (max(ids) if ids else 0), keys
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run")
+    ap.add_argument("ids", nargs="+")
+    ap.add_argument("--operator-approved", action="store_true")
+    a = ap.parse_args()
+    rd = L.resolve_run(a.run)
+    name = os.path.basename(rd)
+    try:
+        A.check("ledger", name, A.ledger_manifest(rd, a.ids, L.ROOT), ids=a.ids, root=L.ROOT)
+    except A.Refused as e:
+        L.die(f"refusing: {e}", 3)
+    lock = L.claims_lock()   # P-12: held from reading the next id to the write; ends with the process
+    chk = L.load_json(os.path.join(rd, "check.json"), "check.json")
+    doc = L.load_json(os.path.join(rd, "output", "claims.json"), "claims.json")
+    claims = {c.get("id"): c for c in doc.get("claims", []) if isinstance(c, dict)}
+    checks = {r["id"]: r for r in chk.get("claims", [])}
+    refs = L.referee_files()
+    top, done = existing()
+    problems = []
+    # P-12 H1: the document and each claim are validated here, not taken from check.json: a worker's own claims.json can
+    # declare kit/claims/1 (no premises, no sentence read), which only a brief the user approved may allow
+    _, doc_errs = L.validate_claims_doc(doc, name, rd)
+    problems += [f"claims.json: {e}" for e in doc_errs]
+    entries = []
+    for cid in a.ids:
+        c = claims.get(cid)
+        if c is None:
+            problems.append(f"{cid}: not in claims.json"); continue
+        if (name, cid) in done:
+            problems.append(f"{cid}: already in CLAIMS.md"); continue
+        cerrs = L.validate_claim(c, doc.get("schema"))
+        if cerrs:
+            problems.append(f"{cid}: malformed: {'; '.join(cerrs)}"); continue
+        cr = checks.get(cid)
+        if cr is None:
+            problems.append(f"{cid}: not in check.json"); continue
+        art = c.get("artifact", {})
+        if art.get("type") != "none":
+            p = os.path.join(rd, art.get("path", ""))
+            if not os.path.isfile(p):
+                problems.append(f"{cid}: artifact missing now"); continue
+            if L.sha256(p) != cr.get("artifact_sha256"):
+                problems.append(f"{cid}: artifact changed since check.json (sha256 mismatch); re-run bin/check"); continue
+            changed = [d for d, h in (cr.get("deps_sha256") or {}).items()   # P-12: the deps the check hashed, too
+                       if not os.path.isfile(os.path.join(rd, d)) or L.sha256(os.path.join(rd, d)) != h]
+            if changed:
+                problems.append(f"{cid}: deps file {', '.join(changed)} changed since check.json (sha256 mismatch); "
+                                "re-run bin/check"); continue
+        rl, _stale = L.live_referees(refs.get((name, cid), []), cr, c)
+        verdicts = [r["verdict"] for r in rl]
+        cross = L.cross_family_need(rd, doc, c, rl)   # LESSONS.md "A cross-family certify read"
+        print(f"{cid} families: {cross[2]}")
+        earned, why = L.earned_tag(c["tag"], cr["check"], verdicts, *L.sentence_need(doc, c, rl), *cross[:2],
+                                   questions=L.proved_questions(rl), mutations_missing=bool(cr.get("mutations_missing")))
+        if earned in ("FALSIFIED", "BLOCKED", "PENDING"):
+            problems.append(f"{cid}: {earned} ({why})"); continue
+        missing = [p.get("what") for p in (c.get("premises") or []) if isinstance(p, dict) and p.get("kind") == "ledger"
+                   and not re.search(rf"^## {re.escape(str(p.get('what', '')).strip())}\s", open(L.CLAIMS_MD).read() if os.path.isfile(L.CLAIMS_MD) else "", re.M)]
+        if missing:   # the outside review's F8: an unknown ledger premise would be recorded, then drop out of claim-deps
+            problems.append(f"{cid}: ledger premise(s) {', '.join(missing)} not in CLAIMS.md"); continue
+        sup = c.get("supersedes")
+        if sup and not (os.path.isfile(L.CLAIMS_MD) and re.search(rf"^## {re.escape(sup)}\s", open(L.CLAIMS_MD).read(), re.M)):
+            problems.append(f"{cid}: supersedes {sup} which is not in CLAIMS.md"); continue
+        for ln in L.notes_for(name, cid, sup):
+            print(f"  {cid}: {ln}")
+        for ln in L.supersession_lines(sup):   # informational, never a refusal
+            print(f"  {cid}: {ln}")
+        for ln in L.model_lines(rd, rl):   # LESSONS.md "The model a worker ran on is recorded": said, never a refusal
+            print(f"  {cid}: {ln}")
+        entries.append((cid, c, cr, rl, earned, why))
+    if problems:
+        print("nothing appended:")
+        for p in problems:
+            print("  " + p)
+        sys.exit(1)
+
+    out, recorded = [], []
+    day = L.now()[:10]
+    for cid, c, cr, rl, earned, why in entries:
+        top += 1
+        gid = f"C-{top:03d}"
+        art = c["artifact"]
+        prem = c.get("premises") or []
+        cond = sorted({x.get("kind") for x in prem if x.get("kind") in L.V.CONDITIONAL_KINDS})
+        # LESSONS.md "Premises on every claim; the primary text quoted; a conditional marker": a conditional entry says so in its header, which
+        # the header pattern (ENTRY_RE) still parses: the marker comes after the run/claim field.
+        lines = [f"## {gid}  [{earned}]  {day}  run {name}/{cid}" + (f"  (conditional: {', '.join(cond)})" if cond else ""),
+                 c["statement"].strip()]
+        if earned != c["tag"]:
+            lines.append(f"Claimed: [{c['tag']}]; earned [{earned}] because {why}.")
+        if art.get("type") == "none":
+            lines.append("Artifact: none")
+        else:
+            rel = os.path.relpath(os.path.join(rd, art["path"]), L.ROOT)
+            extra = f"  cmd=`{art['cmd']}` exit={cr.get('artifact_exit')}" if art["type"] == "script" else ""
+            if art["type"] == "lean":
+                extra = "  decls=" + ",".join(art["decls"]) + "  axioms=" + str(cr.get("axioms"))
+            lines.append(f"Artifact ({art['type']}): {rel}  sha256={cr.get('artifact_sha256')}{extra}")
+            if cr.get("deps_sha256"):
+                lines.append("Deps: " + "; ".join(f"{os.path.relpath(os.path.join(rd, d), L.ROOT)} sha256={h}" for d, h in cr["deps_sha256"].items()))
+        for fld in ("range", "coverage", "evidence", "counter_pressure", "nonrigorous_step", "must_show"):
+            if isinstance(c.get(fld), str) and c[fld].strip():
+                lines.append(f"{fld.replace('_', ' ').capitalize()}: {c[fld].strip()}")
+        if prem:
+            lines.append("Premises: " + "; ".join(
+                f"{x.get('kind')}: {x.get('what', '').strip()}" + "".join(
+                    f" ({f} {os.path.relpath(os.path.join(rd, x[f]), L.ROOT)})" for f in ("source", "quote") if x.get(f))
+                for x in prem))
+        if isinstance(c.get("silent_links"), list):
+            lines.append("Silent links: " + "; ".join(c["silent_links"]))
+        lines.append(f"Check: {cr['check']} ({os.path.relpath(os.path.join(rd, 'check.json'), L.ROOT)}, generated {chk.get('generated')})")
+        pf = chk.get("prose_flags", len(chk.get("result_md", {}).get("banned_untagged", [])))
+        if pf:
+            lines.append(f"Prose: {pf} untagged banned word(s) in result.md (technical flag, not blocking; lines " + ", ".join(str(h["line"]) for h in chk["result_md"]["banned_untagged"]) + ")")
+        lines.append("Referee: " + ("; ".join(f"{r['verdict']} ({r['path']} → {r['pointer']})" for r in rl) if rl else "none"))
+        lines.append(f"Supersedes: {c.get('supersedes') or '—'}")
+        out.append("\n".join(BREAKS.sub(" ", l) for l in lines) + "\n")
+        recorded.append((gid, earned, cid, c["statement"]))
+    try:  # spend the approval only when the append is certain: every entry is built (P-12)
+        appr = A.check("ledger", name, A.ledger_manifest(rd, a.ids, L.ROOT), ids=a.ids, consume=True, root=L.ROOT)
+    except A.Refused as e:
+        L.die(f"refusing: {e}", 3)
+    L.ledger(name, "CLAIM-APPROVAL", f"ledger-claims {' '.join(a.ids)}: consumed user approval {appr}")
+    # CLAIMS.md first, durably, then the ledger's CLAIM lines: a failed write leaves no line saying an entry exists
+    # (the outside review's F11)
+    new = not os.path.isfile(L.CLAIMS_MD)
+    with open(L.CLAIMS_MD, "a") as f:
+        if new:
+            f.write(HEADER)
+        f.write("\n" + "\n".join(out))
+        f.flush()
+        os.fsync(f.fileno())
+    for gid, earned, cid, st in recorded:
+        L.ledger(name, "CLAIM", f"{gid} [{earned}] {cid}: {st[:200]}")
+        print(f"{gid}  [{earned}]  {name}/{cid}")
+    print(f"appended {len(out)} to {os.path.relpath(L.CLAIMS_MD, L.ROOT)}")
+
+
+if __name__ == "__main__":
+    main()

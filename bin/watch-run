@@ -1,0 +1,197 @@
+#!/usr/bin/python3
+"""bin/watch-run RUN [-f] [--last N] [--full] [--thinking]
+
+Human-readable view of a run's transcript (Claude Code stream-json or Codex events). Read-only.
+  RUN         run name (005-attack-audit), a run directory, or a path to a launch log. Reads Claude Code's
+              launch.log and Codex's launch.jsonl, from .claude/state/ext/RUN/logs/ while the run is live and from
+              the run directory after it (LESSONS.md "Transcripts are written outside the worker's reach")
+  -f          follow: keep printing new events as they arrive (Ctrl-C to leave; the run is not affected)
+  --last N    start from the last N events instead of the beginning
+  --full      do not truncate file contents, command output or written files
+  --thinking  show the model's visible thinking text where the log carries it
+"""
+import argparse, glob, json, os, sys, time
+
+ROOT = os.path.realpath(os.environ.get("KIT_ROOT", os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+TTY = sys.stdout.isatty()
+def c(code, s): return f"\033[{code}m{s}\033[0m" if TTY else s
+DIM, BOLD, CYAN, GREEN, RED, YELLOW = "2", "1", "36", "32", "31", "33"
+
+def find_log(run):
+    """The transcript of a run: while it runs, in .claude/state/ext/RUN/logs/ (out of the worker's reach, LESSONS.md
+    "Transcripts are written outside the worker's reach"); after it, in the run directory. Claude Code's stream-json (launch.log) or Codex's events (launch.jsonl)."""
+    if os.path.isfile(run): return run
+    cands = [run] if os.path.isdir(run) else glob.glob(os.path.join(ROOT, "workspace-*", "runs", run))
+    if not cands: sys.exit(f"watch-run: no run directory for {run!r}")
+    rd = os.path.realpath(cands[0])
+    live = os.path.join(ROOT, ".claude", "state", "ext", os.path.basename(rd), "logs")
+    for d in (live, rd):
+        for name in ("launch.log", "launch.jsonl"):
+            p = os.path.join(d, name)
+            if os.path.isfile(p): return p
+    sys.exit(f"watch-run: no launch.log or launch.jsonl yet for {os.path.basename(rd)} (a subagent run has none)")
+
+def clip(text, n_lines, n_chars, full):
+    text = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+    if full: return text
+    lines = text.splitlines()
+    out = "\n".join(lines[:n_lines])[:n_chars]
+    hidden = len(text) - len(out)
+    return out + (c(DIM, f"\n      … {hidden} more characters (use --full)") if hidden > 0 else "")
+
+def indent(s, pad="      "): return "\n".join(pad + l for l in s.splitlines())
+
+class View:
+    def __init__(self, a):
+        self.a, self.turn, self.pending_think, self.run_dir, self.names = a, 0, 0, "", {}
+    def rel(self, p):
+        return p[len(self.run_dir) + 1:] if self.run_dir and p.startswith(self.run_dir + "/") else p
+    def flush_think(self):
+        if self.pending_think:
+            print(c(DIM, f"    · thinking, about {self.pending_think} tokens")); self.pending_think = 0
+    def codex_event(self, o, stamp):
+        """Codex `exec --json` events (LESSONS.md "Networked and Codex launches need their flags bound")."""
+        t, it = o.get("type"), o.get("item") if isinstance(o.get("item"), dict) else {}
+        k = it.get("type")
+        if t == "thread.started":
+            print(c(BOLD, f"== codex thread {o.get('thread_id', '?')}")); return
+        if t == "item.started" and k == "command_execution":
+            self.turn += 1
+            print(c(CYAN, f"{stamp}▶ [{self.turn}] shell"))
+            print(c(YELLOW, indent(clip(it.get("command", ""), 20, 2000, self.a.full)))); return
+        if t == "item.completed" and k == "command_execution":
+            ok = str(it.get("exit_code")) == "0"
+            print(f"    {c(GREEN, '◀ ok') if ok else c(RED, '◀ exit ' + str(it.get('exit_code')))}")
+            out = it.get("aggregated_output") or ""
+            if out.strip(): print(c(DIM, indent(clip(out, 12, 1200, self.a.full))))
+            return
+        if t == "item.completed" and k == "file_change":
+            self.turn += 1
+            for ch in it.get("changes") or []:
+                print(c(CYAN, f"{stamp}▶ [{self.turn}] {ch.get('kind', 'change')} {self.rel(ch.get('path', '?'))}"))
+            return
+        if t == "item.completed" and k == "web_search":
+            self.turn += 1
+            print(c(CYAN, f"{stamp}▶ [{self.turn}] web search: {it.get('query', '')}")); return
+        if t == "item.completed" and k == "agent_message":
+            print(f"{stamp}{c(BOLD, 'says:')}\n{indent(it.get('text', '').rstrip())}"); return
+        if t == "item.completed" and k == "reasoning" and self.a.thinking:
+            print(c(DIM, f"{stamp}thinks:\n{indent(clip(it.get('text', ''), 12, 1200, self.a.full))}")); return
+        if t == "turn.completed":
+            print(c(BOLD, f"{stamp}== turn completed: usage {o.get('usage')}")); return
+        if t in ("error", "turn.failed"):
+            print(c(RED, f"{stamp}== {t}: {clip(o, 6, 600, self.a.full)}")); return
+        if t in ("item.started", "turn.started"):
+            return
+        print(c(DIM, f"{stamp}  [{t}/{k}]"))
+
+    def event(self, o, live):
+        t, st = o.get("type"), o.get("subtype")
+        stamp = c(DIM, time.strftime("%H:%M:%S ")) if live else ""
+        if isinstance(t, str) and (t.startswith(("thread.", "turn.", "item.")) or t == "error"):
+            return self.codex_event(o, stamp)
+        if t == "system" and st == "thinking_tokens":
+            self.pending_think += int(o.get("estimated_tokens_delta") or 0); return
+        if t == "system" and st == "init":
+            self.run_dir = os.environ.get("RUN_DIR", "") or self.run_dir
+            print(c(BOLD, f"== session {o.get('session_id','?')}  model {o.get('model','?')}  tools {','.join(o.get('tools') or [])}")); return
+        if t == "system":
+            self.flush_think(); print(c(DIM, f"{stamp}  [system] {st}: {o.get('status', '')}")); return
+        if t == "assistant":
+            for b in (o.get("message", {}).get("content") or []):
+                if not isinstance(b, dict): continue
+                k = b.get("type")
+                if k == "text" and b.get("text", "").strip():
+                    self.flush_think(); print(f"{stamp}{c(BOLD, 'says:')}\n{indent(b['text'].rstrip())}")
+                elif k == "thinking" and self.a.thinking and b.get("thinking", "").strip():
+                    print(c(DIM, f"{stamp}thinks:\n{indent(clip(b['thinking'], 12, 1200, self.a.full))}"))
+                elif k == "tool_use":
+                    self.flush_think(); self.turn += 1
+                    name, inp = b.get("name", "?"), b.get("input") or {}
+                    self.names[b.get("id")] = name
+                    head = c(CYAN, f"{stamp}▶ [{self.turn}] {name}")
+                    if name == "Read":
+                        rng = f"  (from line {inp['offset']})" if inp.get("offset") else ""
+                        print(f"{head}  {self.rel(inp.get('file_path', '?'))}{rng}")
+                    elif name == "Write":
+                        body = inp.get("content", "")
+                        print(f"{head}  {self.rel(inp.get('file_path', '?'))}  ({len(body)} chars)")
+                        print(indent(clip(body, 25, 2500, self.a.full)))
+                    elif name == "Bash":
+                        print(f"{head}  {inp.get('description', '')}")
+                        print(c(YELLOW, indent(clip(inp.get("command", ""), 20, 2000, self.a.full))))
+                    else:
+                        print(f"{head}  {clip(inp, 6, 600, self.a.full)}")
+            return
+        if t == "user":
+            for b in (o.get("message", {}).get("content") or []):
+                if not (isinstance(b, dict) and b.get("type") == "tool_result"): continue
+                body = b.get("content")
+                if isinstance(body, list):
+                    body = "\n".join(x.get("text", "") for x in body if isinstance(x, dict))
+                body = body or ""
+                name = self.names.get(b.get("tool_use_id"), "")
+                mark = c(RED, "◀ ERROR") if b.get("is_error") else c(GREEN, "◀ ok")
+                if name == "Read" and not b.get("is_error") and not self.a.full:
+                    print(f"    {mark}  {len(body)} chars read")
+                else:
+                    print(f"    {mark}  {len(body)} chars")
+                    if body.strip(): print(c(DIM, indent(clip(body, 12, 1200, self.a.full))))
+            return
+        if t == "result":
+            self.flush_think()
+            keep = {k: o.get(k) for k in ("subtype", "is_error", "num_turns", "duration_ms", "total_cost_usd") if k in o}
+            print(c(BOLD, f"{stamp}== finished: {keep}"))
+            if isinstance(o.get("result"), str) and o["result"].strip():
+                print(indent(clip(o["result"], 30, 3000, self.a.full)))
+            return
+        self.flush_think(); print(c(DIM, f"{stamp}  [{t}/{st}]"))
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("run"); ap.add_argument("-f", action="store_true"); ap.add_argument("--last", type=int, default=0)
+    ap.add_argument("--full", action="store_true"); ap.add_argument("--thinking", action="store_true")
+    a = ap.parse_args()
+    path = find_log(a.run)
+    v = View(a); v.run_dir = os.path.dirname(os.path.abspath(path))
+    if "/.claude/state/ext/" in v.run_dir:   # a live run: its logs are host side, its files in the run directory
+        name = v.run_dir.split("/.claude/state/ext/")[1].split("/")[0]
+        hits = glob.glob(os.path.join(ROOT, "workspace-*", "runs", name))
+        v.run_dir = hits[0] if hits else v.run_dir
+    print(c(DIM, f"# {path}"))
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        backlog = [l for l in fh.read().splitlines() if l.strip()]
+        skip = max(0, len(backlog) - a.last) if a.last else 0
+        if skip: print(c(DIM, f"# {skip} earlier events not shown"))
+        for i, line in enumerate(backlog):
+            try: o = json.loads(line)
+            except ValueError: continue
+            if i < skip:                      # still count turns and remember tool names
+                if o.get("type") == "assistant":
+                    for b in (o.get("message", {}).get("content") or []):
+                        if isinstance(b, dict) and b.get("type") == "tool_use":
+                            v.turn += 1; v.names[b.get("id")] = b.get("name", "?")
+                continue
+            v.event(o, live=False)
+        v.flush_think()
+        if not a.f:
+            print(c(DIM, f"# {v.turn} tool calls so far; rerun, or add -f in a real terminal to follow")); return
+        print(c(DIM, "# following; Ctrl-C leaves the viewer and does not touch the run"))
+        buf = ""
+        try:
+            while True:
+                chunk = fh.read()
+                if not chunk:
+                    time.sleep(1); continue
+                buf += chunk
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    if not line.strip(): continue
+                    try: v.event(json.loads(line), live=True)
+                    except ValueError: pass
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            print()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,414 @@
+#!/usr/bin/python3
+"""bin/check RUN [--timeout SEC] [--claim ID ...] [--mutate]
+
+The Checker of RULES.md step 2: a script, not an LLM. Reads RUN/output/claims.json,
+validates it against SCHEMAS.md, runs every artifact inside the worker sandbox, audits Lean
+axioms, scans result.md for banned untagged words, and writes RUN/check.json plus logs under
+RUN/check/. Exit 0 if every claim is pass or n/a and result.md is within bounds, else 1. For a run with
+any claim in CLAIMS.md the current check.json is first kept as check.<generated>.json (a CHECK-KEPT ledger line),
+because ledger entries cite it by its generation time; exit 2 if that name holds other bytes.
+
+--mutate (LESSONS.md "Optional `artifact.mutations`", audit F7): for every script artifact that declares
+`artifact.mutations` (each {name, cmd[, expect_exit][, expect_stdout_contains]}), run each mutation cmd in the
+sandbox; it perturbs a COPY of the evidence under scratch/ and re-runs the checker on the copy, and must exit
+non-zero (or the given expect_exit) and, when it names one, print its targeted part's FAIL line: a crash or another
+part's failure is then not a kill (LESSONS.md "A mutation kills only with its FAIL line"; a mutation that names no
+line still kills on any non-zero exit, but under kit/claims/2 such a mutation is a form error: P-3 B5). A mutation the checker survives is a coverage claim the
+checker does not certify: the claim is marked fail with the mutation named. Per claim the record
+gets `mutations: {"n": N, "failed_as_expected": k, "results": [...]}`; a VERIFIED script claim
+with no such record (none declared, or declared and not run because --mutate was not given) gets
+`mutations_missing: true` (and `mutations_declared: true` in the second case), and the earned tag (bin/_lib.py
+earned_tag) then records it as NUMERIC, not VERIFIED (P-3 B6; P-12 H3). Without --mutate, mutations are validated for
+shape only and not run.
+
+For a lean artifact it also records each declaration's printed type (`signatures`, `signatures_missing`), and every
+check.json records the shared Lean library's state (`library`), as SCHEMAS.md §2 describes. The axioms are never read
+from the artifact's own file, where its macros apply (P-12: a `macro_rules` for `#print axioms` once hid a `sorry`):
+the artifact is compiled in the sandbox (check/<id>.build/), the host copies only the compiled file into a fresh
+check/<id>.audit-<nonce>/, and a second sandbox call, running no artifact code, replays it through the kernel
+(`leanchecker`) and walks each declaration's constants with harness/lean/KitAudit.lean (`audit_exit`; log
+check/<id>.audit.log). A failed replay or audit fails the claim.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+# Lean quotes the name in single quotes and does not escape a prime inside it: `'A.foo'' depends on axioms: [...]` for
+# A.foo'. The name is everything up to the last `' ` before the fixed tail (LESSONS.md "Lean names ending in a prime";
+# `([^']+)` stopped at the prime and the claim failed with no axioms line).
+AXIOM_RE = re.compile(r"^'(.+?)' (?:depends on axioms: \[(.*?)\]|does not depend on any axioms)\s*$", re.M)
+SIG_START_RE = re.compile(r"^@?([A-Za-z_][A-Za-z0-9_.']*) : (.*)$")  # `@name` when the decl has implicit binders
+
+
+SIG_MARKER = "KIT-SIGNATURES-BEGIN"   # printed by bin/check just before its own `#check` lines
+
+
+def _decl_for(printed, decls, taken):
+    """The declaration a printed name stands for. Lean prints a name relative to the namespaces the file has
+    opened (`criterion` for Pkg.criterion, `Grid.foo` for Pkg.Grid.foo; the source lost two runs' signatures this
+    way), so a printed name matches a declaration equal to it or ending in `.<printed>`. The `#check` lines are
+    emitted in the order of `decls`, so the first match not yet taken is the one."""
+    for d in decls:
+        if d not in taken and (d == printed or d.endswith("." + printed)):
+            return d
+    return None
+
+
+DECL_MARKER = "KIT-SIG "   # printed before each declaration's own `#check`
+
+
+def _parse_marked(lines, decls):
+    """Per-declaration markers: the signature after `KIT-SIG d` is d's, if the printed name fits d. A `#check` that errors
+    leaves its declaration missing instead of lending it the next declaration's signature."""
+    sigs, cur, buf, target = {}, None, [], None
+    def close():
+        if cur:
+            sigs[cur] = "\n".join(buf).rstrip()
+    for line in lines:
+        if line.startswith(DECL_MARKER):
+            close()
+            cur, buf, target = None, [], line[len(DECL_MARKER):].strip()
+            continue
+        m = SIG_START_RE.match(line)
+        if m and target in decls and cur is None and (target == m.group(1) or target.endswith("." + m.group(1))):
+            cur, buf, target = target, [line], None
+        elif cur is not None and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+            buf.append(line)
+        elif cur is not None:
+            close()
+            cur, buf = None, []
+    close()
+    return sigs
+
+
+def parse_signatures(out, decls):
+    """Types printed by `#check @decl`, as emitted by `lake env lean` (bare, continuation lines
+    indented). LESSONS.md "Formal statements captured beside the English": the formal statement is captured so the verdict table can show it
+    beside the English and nobody has to go read the theorem to check fidelity. Only the output after the last
+    SIG_MARKER line is read (an artifact's own `#check` of the same name comes before it); a log without the marker
+    is read whole (LESSONS.md "Every Lean signature is captured")."""
+    lines = out.splitlines()
+    if SIG_MARKER in lines:
+        lines = lines[len(lines) - 1 - lines[::-1].index(SIG_MARKER) + 1:]
+    if any(l.startswith(DECL_MARKER) for l in lines):
+        return _parse_marked(lines, decls)
+    sigs, cur, buf = {}, None, []
+    for line in lines:
+        m = SIG_START_RE.match(line)
+        d = _decl_for(m.group(1), decls, sigs.keys() | {cur}) if m else None
+        if d:
+            if cur:
+                sigs[cur] = "\n".join(buf).rstrip()
+            cur, buf = d, [line]
+        elif cur is not None and (line.startswith(" ") or line.startswith("\t")) and line.strip():
+            buf.append(line)
+        elif cur is not None:
+            sigs[cur] = "\n".join(buf).rstrip()
+            cur, buf = None, []
+    if cur:
+        sigs[cur] = "\n".join(buf).rstrip()
+    return sigs
+
+
+banned_scan = L.banned_scan
+
+
+def check_script(rd, c, art, timeout, logdir):
+    reasons, rec = [], {}
+    p = os.path.join(rd, art["path"])
+    if not os.path.isfile(p) or not L.inside(p, os.path.join(rd, "output")):
+        return "fail", ["artifact file missing: " + art["path"]], rec
+    rec["artifact_sha256"] = L.sha256(p)
+    code, out, err, timed_out = L.sandbox_run(rd, art["cmd"], timeout)
+    L.write_in_run(rd, f"check/{c['id']}.stdout", out)   # P-12 C2: the script just ran, and could have left links
+    L.write_in_run(rd, f"check/{c['id']}.stderr", err)
+    rec["artifact_exit"] = code
+    rec["stdout_tail"] = out[-1000:]
+    if timed_out:
+        return "fail", [f"artifact timed out after {timeout}s"], rec
+    expect = art.get("expect_exit", 0)
+    if code != expect:
+        reasons.append(f"exit {code} != expected {expect}")
+    sub = art.get("expect_stdout_contains")
+    if isinstance(sub, str) and sub not in out:
+        reasons.append("expected stdout substring not found")
+    want = art.get("expect_stdout_sha256")
+    if isinstance(want, str):
+        import hashlib
+        got = hashlib.sha256(out.encode()).hexdigest()
+        rec["stdout_sha256"] = got
+        if got != want:
+            reasons.append("stdout sha256 mismatch")
+    # advisory: floating-point tokens in the script (anti-self-deception #4)
+    try:
+        src = open(p, errors="replace").read()
+        fl = len(re.findall(r"\bfloat\(|np\.float|math\.(sqrt|exp|log|sin|cos)|\bnumpy\.linalg\b", src))
+        if fl:
+            rec["advisory_float_tokens"] = fl
+    except Exception:
+        pass
+    return ("pass" if not reasons else "fail"), reasons, rec
+
+
+def run_mutations(rd, c, art, timeout, logdir):
+    """Run each declared mutation in the sandbox. Returns (reasons, record)."""
+    reasons, results = [], []
+    muts = art.get("mutations") or []
+    for m in muts:
+        code, out, err, timed_out = L.sandbox_run(rd, m["cmd"], timeout)
+        L.write_in_run(rd, f"check/{c['id']}.mut.{re.sub(r'[^A-Za-z0-9_.-]', '_', m['name'])}.log",
+                       out + "\n--- stderr ---\n" + err)
+        want = m.get("expect_exit", "nonzero")
+        line = m.get("expect_stdout_contains")   # LESSONS.md "A mutation kills only with its FAIL line"
+        if timed_out:
+            ok = False; why = f"timed out after {timeout}s"
+        elif want == "nonzero":
+            ok = code != 0; why = f"exit {code}"
+        else:
+            ok = code == want; why = f"exit {code} (expected {want})"
+        if ok and line and line not in out:
+            ok = False; why += f", but not its FAIL line {line!r}: a crash or another part's failure is not a kill"
+        elif line and ok:
+            why += f" with its FAIL line {line!r}"
+        results.append({"name": m["name"], "exit": code, "failed_as_expected": ok, "detail": why})
+        if not ok:
+            reasons.append(f"mutation '{m['name']}' did not fail the checker ({why}): the artifact does not certify the stated coverage")
+    rec = {"n": len(muts), "failed_as_expected": sum(1 for r in results if r["failed_as_expected"]), "results": results}
+    return reasons, rec
+
+
+AUDIT_SRC = os.path.join(L.REAL_ROOT, "harness", "lean", "KitAudit.lean")
+LEAN_PARTS = ("KitArtifact.olean", "KitArtifact.olean.server", "KitArtifact.olean.private")
+
+
+def check_lean(rd, c, art, timeout, logdir):
+    """P-12 (the code audit of 2026-10-02): the axioms are never read from the artifact's own file, where its macros apply
+    (a `macro_rules` for `#print axioms` made a theorem proved by `sorry` print "does not depend on any axioms"). Step 1
+    compiles the artifact, with the signature `#check` lines appended, in the sandbox. Step 2, on the host: a fresh
+    directory holding only the compiled file (read without following a link) and the kit's audit program. Step 3, in the
+    sandbox with no artifact code running: `leanchecker` replays the compiled declarations through the kernel, and
+    harness/lean/KitAudit.lean walks each claimed declaration's constants for axioms."""
+    import secrets
+    import shlex
+    reasons, rec = [], {}
+    p = os.path.join(rd, art["path"])
+    if not os.path.isfile(p) or not L.inside(p, os.path.join(rd, "output")):
+        return "fail", ["artifact file missing: " + art["path"]], rec
+    rec["artifact_sha256"] = L.sha256(p)
+    src = open(p, errors="replace").read()
+    build = f"check/{c['id']}.build"
+    L.write_in_run(rd, f"{build}/KitArtifact.lean",
+                   src.rstrip("\n") + "\n\n"
+                   + f'#print "{SIG_MARKER}"\n'
+                   + "\n".join(f'#print "{DECL_MARKER}{d}"\n#check @{d}' for d in art["decls"]) + "\n")
+    bdir = os.path.join(rd, build)
+    cmd = (f'cd "$KIT_LEAN" && lake env lean --root={shlex.quote(bdir)} -o {shlex.quote(bdir + "/KitArtifact.olean")} '
+           f'{shlex.quote(bdir + "/KitArtifact.lean")}')
+    code, out, err, timed_out = L.sandbox_run(rd, cmd, timeout)
+    L.write_in_run(rd, f"check/{c['id']}.lean.log", out + "\n--- stderr ---\n" + err)
+    rec["artifact_exit"] = code
+    if timed_out:
+        return "fail", [f"lean timed out after {timeout}s"], rec
+    if code != 0:
+        reasons.append(f"lean exit {code}")
+    found = {}
+    if code == 0:
+        nonce = secrets.token_hex(8)
+        audit = f"check/{c['id']}.audit-{nonce}"   # a name the artifact could not know, made fresh
+        try:
+            for part in LEAN_PARTS:
+                try:
+                    data = L.read_in_run(rd, f"{build}/{part}")
+                except FileNotFoundError:
+                    if part == LEAN_PARTS[0]:
+                        raise
+                    continue
+                L.write_in_run(rd, f"{audit}/{part}", data)
+            with open(AUDIT_SRC, "rb") as f:
+                L.write_in_run(rd, f"{audit}/KitAudit.lean", f.read())
+        except OSError as e:
+            reasons.append(f"the compiled artifact could not be taken for the audit: {e}")
+        else:
+            adir = shlex.quote(os.path.join(rd, audit))
+            inner = (f'export LEAN_PATH={adir}:"$LEAN_PATH" && leanchecker KitArtifact && '
+                     f'lean --run {adir}/KitAudit.lean {nonce} KitArtifact ' + " ".join(shlex.quote(d) for d in art["decls"]))
+            acode, aout, aerr, ato = L.sandbox_run(rd, f'cd "$KIT_LEAN" && lake env sh -c {shlex.quote(inner)}', timeout)
+            L.write_in_run(rd, f"check/{c['id']}.audit.log", aout + "\n--- stderr ---\n" + aerr)
+            rec["audit_exit"] = acode
+            if ato:
+                reasons.append(f"the axiom audit timed out after {timeout}s")
+            elif acode != 0:
+                reasons.append(f"the kernel replay or the axiom audit failed (exit {acode}); see check/{c['id']}.audit.log")
+            for line in aout.splitlines():
+                m = re.match(rf"^{nonce} AXIOMS (\S+) \[(.*)\]$", line)
+                if m:
+                    found[m.group(1)] = [a.strip() for a in m.group(2).split(",") if a.strip()]
+    if "declaration uses `sorry`" in out + err:
+        rec["advisory_file_has_sorry"] = True  # per-declaration sorryAx audit below is what decides
+    rec["axioms"] = found
+    sigs = parse_signatures(out, art["decls"])
+    if sigs:
+        rec["signatures"] = sigs
+    missing = [d for d in art["decls"] if d not in sigs]
+    if missing:  # advisory: a capture failure is a limitation of this parser, not a defect in the claim
+        rec["signatures_missing"] = missing
+    for d in art["decls"]:
+        if d not in found:
+            reasons.append(f"no axioms line for {d} (unknown constant or compile error)")
+            continue
+        ax = set(found[d])
+        if "sorryAx" in ax:
+            reasons.append(f"{d} depends on sorryAx")
+        native = {x for x in ax if L.is_native_axiom(x)}
+        if native:
+            rec.setdefault("native_decide", []).append(d)
+            if art.get("native_decide") is not True:
+                reasons.append(f"{d} uses native_decide ({sorted(native)}) but artifact.native_decide is not true")
+        other = ax - L.CLEAN_AXIOMS - native - {"sorryAx"}
+        if other:
+            reasons.append(f"{d} depends on non-standard axioms {sorted(other)}")
+    return ("pass" if not reasons else "fail"), reasons, rec
+
+
+def check_text(rd, c, art):
+    rec = {}
+    p = os.path.join(rd, art["path"])
+    if not os.path.isfile(p) or not L.inside(p, os.path.join(rd, "output")) or os.path.getsize(p) == 0:
+        return "fail", ["artifact file missing or empty: " + art["path"]], rec
+    rec["artifact_sha256"] = L.sha256(p)
+    hits = banned_scan(p)
+    if hits:
+        rec["banned_untagged"] = hits
+    return "n/a", ["prose artifact: a referee is required; no script can certify it"], rec
+
+
+def keep_cited_record(rd, name):
+    """LESSONS.md "A ledgered run's check record is kept" (the source's method change 56): a CLAIMS.md entry cites
+    RUN/check.json by its generation time, and a later bin/close-run once rewrote a run's record after its claims were
+    appended. So before a run with any ledgered claim is re-checked, its current record is kept as check.<generated>.json
+    (characters outside [0-9A-Za-z.-] replaced by '-'). A kept file is never overwritten: the same bytes are accepted,
+    other bytes refused. A run with no ledgered claim is rewritten as before. Returns the kept path, or None."""
+    cur = os.path.join(rd, "check.json")
+    if not os.path.isfile(cur) or not any(e["run"] == name for e in L.global_entries().values()):
+        return None
+    gen = L.load_json(cur, "check.json").get("generated") or "unknown"
+    kept = os.path.join(rd, "check." + re.sub(r"[^0-9A-Za-z.-]", "-", str(gen)) + ".json")
+    rel = os.path.relpath(kept, L.ROOT)
+    if os.path.exists(kept):
+        if L.sha256(kept) != L.sha256(cur):
+            L.die(f"refusing: {rel} already exists with other bytes than check.json; a kept check record is never overwritten")
+        return kept
+    with open(cur, "rb") as src, open(kept, "xb") as dst:
+        dst.write(src.read())
+    L.ledger(name, "CHECK-KEPT", f"{rel} (generated {gen}), before a re-check of a run with ledgered claims")
+    return kept
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run")
+    ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--claim", action="append", default=None, help="check only these ids")
+    ap.add_argument("--mutate", action="store_true", help="also run each script artifact's declared mutation tests")
+    a = ap.parse_args()
+    rd = L.resolve_run(a.run)
+    name = os.path.basename(rd)
+    kept = keep_cited_record(rd, name)   # before anything is re-checked
+    if kept:
+        print(f"kept the cited record: {os.path.relpath(kept, L.ROOT)}")
+    logdir = os.path.join(rd, "check")   # written only through L.write_in_run, which makes it (P-12 C2)
+
+    doc = L.load_json(os.path.join(rd, "output", "claims.json"), "claims.json")
+    claims, doc_errs = L.validate_claims_doc(doc, name, rd)
+    out = {"schema": L.CHECK_SCHEMA, "run": name, "generated": L.now(), "doc_errors": doc_errs, "claims": []}
+
+    for c in claims:
+        cid = c.get("id") if isinstance(c, dict) else None
+        if a.claim and cid not in a.claim:
+            continue
+        errs = L.validate_claim(c, doc.get("schema"))
+        if not errs and isinstance(c.get("premises"), list):   # a ledger premise must name an entry that exists (review F8)
+            known = L.global_entries()
+            errs = [f"ledger premise {p.get('what')} is not an entry of CLAIMS.md" for p in c["premises"]
+                    if isinstance(p, dict) and p.get("kind") == "ledger" and p.get("what", "").strip() not in known]
+        rec = {"id": cid, "tag": c.get("tag") if isinstance(c, dict) else None}
+        if errs:
+            rec.update(check="fail", reasons=["malformed: " + e for e in errs])
+            out["claims"].append(rec)
+            continue
+        art = c["artifact"]
+        t = art["type"]
+        if t == "script":
+            st, reasons, extra = check_script(rd, c, art, a.timeout, logdir)
+            if a.mutate and st == "pass" and art.get("mutations"):
+                mreasons, extra["mutations"] = run_mutations(rd, c, art, a.timeout, logdir)
+                if mreasons:
+                    st, reasons = "fail", reasons + mreasons
+            if c.get("tag") == "VERIFIED" and "mutations" not in extra:
+                # P-3 B6; P-12 H3: no mutation record from this check (none declared, or declared and not run: a check
+                # without --mutate) is "missing", and the earned tag records such a claim as NUMERIC, not VERIFIED
+                extra["mutations_missing"] = True
+                if art.get("mutations"):
+                    extra["mutations_declared"] = True
+        elif t == "lean":
+            st, reasons, extra = check_lean(rd, c, art, a.timeout, logdir)
+        elif t == "text":
+            st, reasons, extra = check_text(rd, c, art)
+        else:
+            st, reasons, extra = "n/a", ["no artifact"], {}
+        if t != "none" and art.get("deps"):
+            extra["deps_sha256"] = {}
+            for d in art["deps"]:
+                dp = os.path.join(rd, d)
+                if os.path.isfile(dp) and L.inside(dp, os.path.join(rd, "output")):
+                    extra["deps_sha256"][d] = L.sha256(dp)
+                else:
+                    st = "fail"; reasons.append(f"deps file missing: {d}")
+        rec.update(check=st, reasons=reasons, **extra)
+        out["claims"].append(rec)
+
+    rmd = os.path.join(rd, "output", "result.md")
+    hits = banned_scan(rmd)
+    if hits is None:
+        out["result_md"] = {"exists": False}
+    else:
+        n = sum(1 for _ in open(rmd, errors="replace"))
+        out["result_md"] = {"exists": True, "lines": n, "within_limit": n <= 150, "banned_untagged": hits}
+
+    if a.claim:  # partial check: merge into the existing check.json, keep the other claims' records
+        prev_path = os.path.join(rd, "check.json")
+        if os.path.isfile(prev_path):
+            prev = L.load_json(prev_path, "check.json")
+            new_ids = {r["id"] for r in out["claims"]}
+            out["claims"] = [r for r in prev.get("claims", []) if r["id"] not in new_ids] + out["claims"]
+            order = {c.get("id"): i for i, c in enumerate(claims) if isinstance(c, dict)}
+            out["claims"].sort(key=lambda r: order.get(r["id"], 999))
+            out["partial"] = sorted(new_ids)
+    ok_claims = all(r["check"] in ("pass", "n/a") for r in out["claims"]) and not doc_errs
+    ok_md = out["result_md"].get("exists") and out["result_md"].get("within_limit")
+    out["library"] = L.library_state()  # LESSONS.md "The Lean library has a master list": what the shared Lean library was, recorded per run
+    out["prose_flags"] = len(out["result_md"].get("banned_untagged", []))  # noted, never blocking (check/2)
+    out["overall"] = "pass" if (ok_claims and ok_md) else "fail"
+    L.write_json(os.path.join(rd, "check.json"), out)
+
+    for r in out["claims"]:
+        mut = r.get("mutations")
+        mtxt = f"  mutations: {mut['failed_as_expected']}/{mut['n']} failed as expected" if mut else (
+            ("  mutations: not run (VERIFIED needs them run: bin/check --mutate)" if r.get("mutations_declared") else
+             "  mutations: none declared (VERIFIED needs one)") if r.get("mutations_missing") else "")
+        print(f"{r['id']:>5}  {str(r['tag']):<10} {r['check']:<5} {'; '.join(r['reasons'])[:120]}{mtxt}")
+    if doc_errs:
+        print("doc errors:", "; ".join(doc_errs))
+    md = out["result_md"]
+    print(f"result.md: {'missing' if not md.get('exists') else str(md['lines']) + ' lines, ' + str(len(md['banned_untagged'])) + ' banned-untagged (noted, not blocking)'}")
+    print(f"overall: {out['overall']}  -> {os.path.relpath(os.path.join(rd, 'check.json'), L.ROOT)}")
+    L.ledger(name, "CHECK", f"overall={out['overall']} " + " ".join(f"{r['id']}={r['check']}" for r in out["claims"]))
+    sys.exit(0 if out["overall"] == "pass" else 1)
+
+
+if __name__ == "__main__":
+    main()

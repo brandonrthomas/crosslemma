@@ -1,0 +1,230 @@
+#!/usr/bin/python3
+"""bin/claims-extract [--through C-NNN] [--ids C-NNN ...] [--library PREFIX ...] [--supplied PREFIX=PATH ...] [--date YYYY-MM-DD]
+                   [--out FILE]
+
+The worker's view of the ledger (LESSONS.md "A worker's extract of the ledger is made by a tool"). A worker never receives
+CLAIMS.md (bin/new-run refuses it); it receives this extract, made by fixed rules so that it is reproducible:
+  kept      every entry no later entry supersedes, less the instance's excluded entries; for each, its header line verbatim,
+            its statement verbatim, "Lean declarations: …" (a lean artifact) or "Artifact type: …", and its Claimed,
+            Premises and Supersedes lines where it has them (bin/ledger-claims writes these lines)
+  notes     the notes on kept entries, verbatim, in ledger order, less the instance's excluded notes, after the entries
+  left out  superseded entries; every other line of an entry (artifact paths and hashes, deps, range, coverage,
+            evidence, counter pressure, nonrigorous step, must show, silent links, check, prose, referee)
+  header    the date, the entry range and counts, what is left out, and where the declarations are: PREFIX.* in the
+            linked library for each --library; PREFIX.* at PATH for each --supplied; every other prefix "not supplied"
+The exclusions are the user's, in data/packet-rules.json under "extract" (bin/packet-block --extract C-NNN,
+--extract-note C-NNN DATE; the hook keeps the orchestrator out of both): for instance the entries of a heuristic model
+whose probabilities no worker should receive. The extract names what it leaves out by id and date, never the why. --through C-NNN reads the ledger as it stood
+when C-NNN was its last entry. --ids C-NNN ... extracts exactly those entries, superseded or not (a claim's `ledger`
+premises name what it rests on; a superseded one is marked "Superseded by: …"), by the same rules and exclusions: what
+bin/new-run gives a referee of such a claim as input/ledger-premises.md (LESSONS.md "A referee is given the ledger entries a
+claim rests on"). Prints to stdout, or writes FILE (then one CLAIMS-EXTRACT ledger line with its sha256).
+Read-only otherwise. The extract is a packet file: bin/lint-brief scans it with the rest. KIT_ROOT points it at a fixture tree.
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import sys
+import textwrap
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+def exclusions():
+    """(entry ids, {(id, date)}) the user leaves out of workers' extracts: data/packet-rules.json "extract"."""
+    p = os.path.join(L.ROOT, "data", "packet-rules.json")
+    try:
+        x = (json.load(open(p)).get("extract") or {}) if os.path.isfile(p) else {}
+    except (OSError, ValueError) as e:
+        L.die(f"cannot read {p}: {e}")
+    return [e["id"] for e in x.get("entries", [])], {(e["id"], e["date"]) for e in x.get("notes", [])}
+
+
+HEAD_RE = re.compile(r"^## (C-\d{3,})  ", re.M)
+NOTE_RE = re.compile(r"^## (C-\d{3,})-note  (\S+)  ")
+
+
+def blocks(text):
+    """[(kind, id, lines)]: kind "entry" or "note", in ledger order; a note is one line."""
+    out = []
+    for chunk in re.split(r"(?m)^(?=## C-\d)", text):
+        if not chunk.startswith("## C-"):
+            continue
+        first = chunk.split("\n", 1)[0]
+        m = NOTE_RE.match(first)
+        if m:
+            out.append(("note", m.group(1), [first], m.group(2)))
+            continue
+        m = HEAD_RE.match(first)
+        if not m:
+            L.die(f"unparsed ledger line: {first[:80]}")
+        out.append(("entry", m.group(1), chunk.rstrip("\n").split("\n"), None))
+    return out
+
+
+def render_entry(lines):
+    head = lines[0]
+    k = next((j for j, ln in enumerate(lines) if j and ln.startswith(("Claimed: ", "Artifact (", "Artifact: none"))), None)
+    if k is None or k < 2:
+        L.die(f"no statement or no Artifact line in {head}")
+    out, lines = lines[:k], [head, "\n".join(lines[1:k])] + lines[k:]   # a statement may run over several lines
+    art = next((ln for ln in lines[2:] if ln.startswith(("Artifact (", "Artifact: none"))), None)
+    if art is None:
+        L.die(f"no Artifact line in {head}")
+    kind = "none" if art.startswith("Artifact: none") else art[len("Artifact ("):art.index(")")]
+    claimed = [ln for ln in lines[2:] if ln.startswith("Claimed: ")]
+    out += claimed
+    if kind == "lean":
+        m = re.search(r"\bdecls=(\S+)", art)
+        if not m:
+            L.die(f"lean artifact without decls in {head}")
+        out.append("Lean declarations: " + ", ".join(m.group(1).split(",")))
+    else:
+        out.append("Artifact type: " + kind)
+    out += [ln for ln in lines[2:] if ln.startswith(("Premises: ", "Supersedes: "))]
+    return out
+
+
+def decl_prefixes(lines):
+    art = next((ln for ln in lines[2:] if ln.startswith("Artifact (")), "")
+    m = re.search(r"\bdecls=(\S+)", art)
+    return [d.split(".")[0] for d in m.group(1).split(",")] if m and art.startswith("Artifact (lean)") else []
+
+
+def wrap(s):
+    return textwrap.fill(s, width=120, break_long_words=False, break_on_hyphens=False)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--through", metavar="C-NNN")
+    ap.add_argument("--ids", nargs="+", metavar="C-NNN", help="exactly these entries (a claim's ledger premises)")
+    ap.add_argument("--library", action="append", default=[], metavar="PREFIX",
+                    help="declarations PREFIX.* are in the linked library ($KIT_LEAN)")
+    ap.add_argument("--supplied", action="append", default=[], metavar="PREFIX=PATH",
+                    help="declarations PREFIX.* are in PATH of the packet (e.g. Aux7=input/Aux7.lean)")
+    ap.add_argument("--date", default=datetime.date.today().isoformat())
+    ap.add_argument("--out")
+    a = ap.parse_args()
+    supplied = []
+    for s in a.supplied:
+        if "=" not in s or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=\S+$", s):
+            L.die(f"--supplied wants PREFIX=PATH: {s}")
+        supplied.append(tuple(s.split("=", 1)))
+    try:
+        text = open(L.CLAIMS_MD).read()
+    except OSError as e:
+        L.die(f"cannot read CLAIMS.md: {e}")
+    if a.through:
+        if not re.match(r"^C-\d{3,}$", a.through):
+            L.die("--through wants C-NNN")
+        n = int(a.through[2:])
+        later = [m for m in HEAD_RE.finditer(text) if int(m.group(1)[2:]) > n]
+        if not any(int(m.group(1)[2:]) == n for m in HEAD_RE.finditer(text)):
+            L.die(f"{a.through} is not an entry of CLAIMS.md")
+        text = text[:later[0].start()] if later else text
+    bl = blocks(text)
+    entries = [(i, ln) for k, i, ln, _ in bl if k == "entry"]
+    if not entries:
+        L.die("CLAIMS.md has no entries")
+    ids = [i for i, _ in entries]
+    if len(set(ids)) != len(ids):
+        L.die("an entry id occurs twice in CLAIMS.md")
+    superseded = set()
+    for i, ln in entries:
+        for x in ln[2:]:
+            if x.startswith("Supersedes: "):
+                superseded |= set(re.findall(r"C-\d{3,}", x))
+    live = [(i, ln) for i, ln in entries if i not in superseded]
+    EXCLUDED_ENTRIES, EXCLUDED_NOTES = exclusions()
+    kept = [(i, ln) for i, ln in live if i not in EXCLUDED_ENTRIES]
+    sup_by = {}   # C-NNN -> the entry that supersedes it
+    for i, ln in entries:
+        for x in ln[2:]:
+            if x.startswith("Supersedes: "):
+                for old in re.findall(r"C-\d{3,}", x):
+                    sup_by[old] = i
+    if a.ids:
+        bad = [x for x in a.ids if not re.match(r"^C-\d{3,}$", x) or x not in ids]
+        if bad:
+            L.die(f"--ids: not entries of CLAIMS.md: {', '.join(bad)}")
+        kept = [(i, ln) for i, ln in entries if i in a.ids and i not in EXCLUDED_ENTRIES]
+    kept_ids = {i for i, _ in kept}
+    notes = [ln[0] for k, i, ln, d in bl if k == "note" and i in kept_ids and (i, d) not in EXCLUDED_NOTES]
+
+    prefixes = []
+    for _, ln in kept:
+        for p in decl_prefixes(ln):
+            if p not in prefixes:
+                prefixes.append(p)
+    sup = dict(supplied)
+    other = [p for p in prefixes if p not in a.library and p not in sup]
+    parts = ([f"{p}.* are in the library mounted at $KIT_LEAN" for p in a.library]
+             + [f"{p}.* are in {path}" for p, path in supplied])
+    decl_line = ("Declarations named " + "; ".join(parts)) if parts else "No declarations are supplied"
+    if other:
+        decl_line += (("; other prefixes (" if parts else ": the prefixes (") + ", ".join(p + ".*" for p in other)
+                      + ") are in files not supplied")
+    decl_line += "."
+    excl = ([i for i in a.ids if i in EXCLUDED_ENTRIES] if a.ids else [i for i in EXCLUDED_ENTRIES if i in {x for x, _ in live}])
+    excl_notes = {}   # date -> ids, for the notes actually present and left out
+    for i, d in EXCLUDED_NOTES:
+        if any(k == "note" and j == i and dd == d for k, j, _, dd in bl):
+            excl_notes.setdefault(d, []).append(i)
+    and_list = lambda xs: xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " and " + xs[-1]
+    left = [f"superseded entries ({', '.join(sorted(superseded, key=lambda x: int(x[2:])))})"] if superseded and not a.ids else []
+    left.append("artifact paths and hashes")
+    if excl:
+        left.append(f"entries the user excludes ({', '.join(excl)}) and their notes")
+    left.append("deps, range, coverage, evidence, counter-pressure, nonrigorous-step, must-show, silent-links, check, "
+                "prose and referee lines")
+    for d, xs in excl_notes.items():
+        left.append(f"the notes of {d} on {and_list(xs)}")
+    asked = and_list(a.ids) if a.ids else ""
+    scope = (f"It lists the entries {asked}, which a claim names as its ledger premises, superseded or not ({len(kept)} "
+             f"given). " if a.ids else
+             f"It lists {len(kept)} of the {len(live)} entries that no later entry supersedes. ")
+    head = [
+        f"# Ledger extract: the entries {asked}" if a.ids else "# Ledger extract: the live entries of this workspace's CLAIMS.md",
+        "",
+        wrap(f"A mechanical extract made by bin/claims-extract on {a.date} from CLAIMS.md (entries {ids[0]} to "
+             f"{ids[-1]}). " + scope + "For each: the "
+             "header line (id, tag as earned, date, run/claim), the statement verbatim, the artifact type (for a Lean "
+             "artifact, its declaration names), and the Claimed, Premises and Supersedes lines where the entry has them"
+             + (", and \"Superseded by\" for one a later entry replaces" if a.ids else "") + ". "
+             "Left out: " + "; ".join(left) + ". Notes on "
+             + ("these entries" if a.ids else "live entries") + " follow the entries, verbatim; a note is the "
+             "orchestrator's, not refereed."),
+        "",
+        wrap("Tags as earned: [PROVED] means the check did not fail and every referee held (for a Lean artifact the "
+             "kernel checked the proof and the referees checked that the English says what the formal statement says). "
+             "An entry whose header ends \"(conditional: ...)\" rests on the premises its Premises line names, and so "
+             "does an entry whose statement says \"taking ... as stated\", \"assuming ...\" or \"Taking C-NNN as ...\"."),
+        wrap(decl_line),
+        "",
+    ]
+    body = []
+    for i, ln in kept:
+        body += render_entry(ln) + ([f"Superseded by: {sup_by[i]}"] if a.ids and i in sup_by else []) + [""]
+    body += ["# Notes on " + ("these entries" if a.ids else "live entries") + " (verbatim; the orchestrator's, not refereed)", ""]
+    for n in notes:
+        body += [n, ""]
+    out = "\n".join(head + body).rstrip("\n") + "\n"
+    if a.out:
+        if os.path.basename(a.out) in L.FORBIDDEN_INPUT_NAMES:
+            L.die(f"refusing to write a record file name: {a.out}")
+        with open(a.out, "w") as f:
+            f.write(out)
+        h = L.sha256(a.out)
+        print(f"wrote {a.out}  entries {len(kept)} of {len(live)} live, notes {len(notes)}, sha256 {h}")
+        L.ledger(None, "CLAIMS-EXTRACT", f"out={a.out} through={a.through or ids[-1]} entries={len(kept)} "
+                                         + (f"ids={','.join(a.ids)} " if a.ids else "")
+                                         + f"notes={len(notes)} sha256={h}")
+    else:
+        sys.stdout.write(out)
+
+
+if __name__ == "__main__":
+    main()

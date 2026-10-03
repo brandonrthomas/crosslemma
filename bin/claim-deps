@@ -1,0 +1,58 @@
+#!/usr/bin/python3
+"""bin/claim-deps [C-NNN ...]   (read-only; LESSONS.md "Dependencies between ledger entries are read by bytes and by name")
+
+Dependencies between CLAIMS.md entries. X depends on Y when Y's artifact (by sha256) is X's artifact or one of
+X's deps ("file"), when X's statement or silent links name Y ("names"), or when X's Premises line lists Y as a
+ledger premise ("premise"). Notes are not read.
+  no argument   every live entry that depends directly on a superseded entry (a file restated under a live
+                entry counts as the live entry's; an entry's own predecessor is not listed)
+  C-NNN ...     for each: what it depends on, and every entry that depends on it (with depth), marked live or
+                superseded
+Exit 0 always: this is a report, never a block. bin/close-run and bin/ledger-claims print the same dependents
+for any id a claim supersedes.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+
+def fmt(rows):
+    return [f"{g}{'' if live else ' (superseded)'}  depth {d}  via {'+'.join(k)}" for g, d, k, live in rows]
+
+
+def main():
+    ids = sys.argv[1:]
+    if ids and ids[0] in ("-h", "--help"):
+        print(__doc__)
+        return
+    ent, superseded, edges = L.claim_graph()
+    if not ids:
+        found = False
+        for s in sorted(superseded):
+            live = [r for r in L.dependents(s) if r[3] and r[1] == 1]
+            if live:
+                found = True
+                print(f"{s} (superseded) has live dependents:")
+                for ln in fmt(live):
+                    print("  " + ln)
+        if not found:
+            print("no live entry depends on a superseded entry")
+        return
+    for gid in ids:
+        if gid not in ent:
+            print(f"{gid}: not an entry of CLAIMS.md")
+            continue
+        print(f"{gid} [{ent[gid]['tag']}]{' (superseded)' if gid in superseded else ''}")
+        deps = edges.get(gid, {})
+        print("  depends on: " + (", ".join(f"{y}{' (superseded)' if y in superseded else ''} via {'+'.join(k)}"
+                                          for y, k in sorted(deps.items())) or "none on the ledger"))
+        rows = L.dependents(gid)
+        print("  depended on by:" + ("" if rows else " none"))
+        for ln in fmt(rows):
+            print("    " + ln)
+
+
+if __name__ == "__main__":
+    main()

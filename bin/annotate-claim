@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""bin/annotate-claim C-NNN "text" [--dry-run]  ·  bin/annotate-claim --batch FILE [--dry-run]
+
+Appends a note to CLAIMS.md for an existing entry (LESSONS.md "A changed novelty or an audit finding", 2026-09-16):
+
+    ## C-049-note  2026-09-16  <text>
+
+CLAIMS.md is append-only, so this is the only way to record something about a claim after the
+fact WITHOUT changing its truth: novelty status found later (an entry turns out to be a known result), an audit
+finding on the artifact's coverage or wording, a pointer to a later run.
+A changed truth is not a note: it is a new claim that `supersedes` the old one. bin/merge,
+bin/ledger-claims and bin/close-run print existing notes for an id they touch.
+Refused: an id with no `## C-NNN  [TAG]` header, an empty text, text with a `## ` line in it,
+no valid user approval (LESSONS.md "Every launch and every ledger append consumes a byte-bound": `bin/approve --annotate C-NNN "text"` with exactly this
+text, within 30 minutes, CLAIMS.md unchanged since; consumed by the append). --operator-approved is
+still accepted and means nothing.
+LESSONS.md "A note says whose it is and does not vouch for the entry": a note is the orchestrator's, and no referee reads it,
+so it may not vouch for the entry: text saying that the entry's truth is unchanged is refused (before
+the approval is touched), and every note is appended with the fixed ending NOTE_SUFFIX.
+--batch FILE: several notes from a JSON list of {id, text}, on one approval (`bin/approve --annotate-batch FILE`,
+every note printed in full), appended in one write, all or none (LESSONS.md "One approval for several notes").
+--dry-run: every check except the approval; prints the line that would be appended; appends nothing.
+Use it before offering the approval, so a refused text never costs one.
+"""
+import argparse
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+import _approval as A
+
+NOTE_SUFFIX = "(Note by the orchestrator, not refereed.)"
+VOUCH_RE = re.compile(r"\btruth\b.{0,60}\bunchanged\b|\bunchanged\b.{0,60}\btruth\b", re.I | re.S)
+
+
+def note_line(gid, raw, entries):
+    """The line to append for one note, or die with the reason (every check but the approval)."""
+    if not re.match(r"^C-[0-9]{3,}$", gid):
+        L.die(f"{gid!r} is not a global claim id C-NNN")
+    text = " ".join(raw.split())
+    if not text:
+        L.die(f"{gid}: empty note")
+    if "## " in text:
+        L.die(f"{gid}: note may not contain a heading marker")
+    if len(text) > 1500:
+        L.die(f"{gid}: note is {len(text)} chars; keep it under 1500 (put the long form in a run's output/ and point at it)")
+    if gid not in entries:
+        L.die(f"{gid} has no entry in CLAIMS.md")
+    if VOUCH_RE.search(text):
+        L.die(f"{gid}: a note may not say that the entry's truth is unchanged: no referee reads notes; state the finding only")
+    # the fixed ending once, even when the text already carries it (the source's list, 2026-09-30, item 7)
+    end = "" if text.endswith(NOTE_SUFFIX) else " " + NOTE_SUFFIX
+    return f"## {gid}-note  {L.now()[:10]}  {text}{end}", text
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("id", nargs="?")
+    ap.add_argument("text", nargs="?")
+    ap.add_argument("--batch", metavar="FILE", help="several notes from a JSON list of {id, text} (one approval: "
+                                                    "--annotate-batch FILE); all are appended in one write, or none")
+    ap.add_argument("--operator-approved", action="store_true")
+    ap.add_argument("--dry-run", action="store_true", help="check everything but the approval; append nothing")
+    a = ap.parse_args()
+    entries = L.global_entries()
+    if a.batch:
+        if a.id or a.text:
+            L.die("--batch FILE takes no id or text")
+        try:
+            key, man, notes = A.annotate_batch(a.batch, L.ROOT)
+        except A.Refused as e:
+            L.die(str(e))
+        lines = [note_line(n["id"], n["text"], entries) for n in notes]
+    else:
+        if not (a.id and a.text is not None):
+            L.die('usage: bin/annotate-claim C-NNN "text" | --batch FILE')
+        key, man = a.id, A.annotate_manifest(a.text, L.ROOT)
+        lines = [note_line(a.id, a.text, entries)]
+    if a.dry_run:
+        for line, _ in lines:
+            print(line)
+        return
+    lock = L.claims_lock()   # P-12: no other append between the approval's CLAIMS.md hash and this write
+    try:
+        A.check("annotate", key, man, consume=True, root=L.ROOT)
+    except A.Refused as e:
+        L.die(f"refusing: {e}", 3)
+    with open(L.CLAIMS_MD, "a") as f:
+        f.write("".join(f"\n{line}\n" for line, _ in lines))
+    for (line, text), gid in zip(lines, [l.split()[1][:-len("-note")] for l, _ in lines]):
+        L.ledger(None, "CLAIM-NOTE", f"{gid}: {text[:300]}")
+    print(f"appended {len(lines)} note(s) to {os.path.relpath(L.CLAIMS_MD, L.ROOT)}: "
+          + ", ".join(l.split()[1] for l, _ in lines))
+
+
+if __name__ == "__main__":
+    main()

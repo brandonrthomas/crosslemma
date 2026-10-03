@@ -1,0 +1,4 @@
+#!/bin/bash
+# exa "query" [numResults]  -> Exa search JSON with text excerpts, through the gateway
+q=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")
+exec curl -sS --max-time 150 "$GATEWAY/exa?q=$q&n=${2:-10}"

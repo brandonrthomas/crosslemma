@@ -1,0 +1,123 @@
+#!/usr/bin/python3
+"""bin/packet-block PATH "why"                  THE USER'S ACT (LESSONS.md "No packet carries blocked material").
+   bin/packet-block --lines REGEX PATH "why"
+   bin/packet-block --extract C-NNN "why"
+   bin/packet-block --extract-note C-NNN YYYY-MM-DD "why"
+   bin/packet-block --list
+
+Adds to data/packet-rules.json, the instance's list of what no worker's packet may carry (bin/_packet.py): PATH (a file
+or directory inside the tree, root-relative in the list; one not yet made is blocked with a warning) out of every packet whole, or, with --lines, only the lines of
+PATH matching REGEX (case-insensitive). --extract leaves ledger entry C-NNN and its notes out of every bin/claims-extract,
+--extract-note only its notes of that date. The hook refuses every orchestrator command or edit that names the list or this
+tool (a plain git add / commit / status / diff of the list excepted): what is blocked is the user's, run with `!`.
+Each addition is ledgered as the user's (PACKET-BLOCK). An entry is removed by editing the list by hand.
+"""
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _approval as A
+
+LIST = os.path.join(A.ROOT, "data", "packet-rules.json")
+
+
+def load():
+    try:
+        with open(LIST) as f:
+            r = json.load(f)
+    except FileNotFoundError:
+        r = {}
+    r.setdefault("blocked", [])
+    r.setdefault("lines", [])
+    return r
+
+
+def save(r, detail):
+    """The list changes only once its PACKET-BLOCK line is on the ledger (pending item P-4, user 2026-10-01): the new list is
+    staged, the line written, then the list replaced; with no ledger the stage is removed and nothing changes."""
+    os.makedirs(os.path.dirname(LIST), exist_ok=True)
+    with open(LIST + ".tmp", "w") as f:
+        json.dump(r, f, indent=1)
+        f.write("\n")
+    try:
+        A.ledger(A.ROOT, None, "PACKET-BLOCK", detail)
+    except OSError as e:
+        os.remove(LIST + ".tmp")
+        print(f"refused: the ledger line could not be written ({e}); the list is unchanged", file=sys.stderr)
+        sys.exit(1)
+    os.replace(LIST + ".tmp", LIST)
+
+
+def extract(args):
+    """--extract C-NNN "why" / --extract-note C-NNN DATE "why": into r["extract"], ledgered."""
+    note = args[0] == "--extract-note"
+    if len(args) != (4 if note else 3) or not args[-1].strip() or not re.match(r"^C-\d{3,}$", args[1]) \
+            or (note and not re.match(r"^\d{4}-\d{2}-\d{2}$", args[2])):
+        print(__doc__, file=sys.stderr)
+        return 2
+    gid, why = args[1], " ".join(args[-1].split())
+    r = load()
+    x = r.setdefault("extract", {})
+    key = "notes" if note else "entries"
+    entry = {"id": gid, "date": args[2]} if note else {"id": gid}
+    if any(all(e.get(k) == v for k, v in entry.items()) for e in x.setdefault(key, [])):
+        print(f"already on the list: {' '.join(entry.values())}")
+        return 0
+    x[key].append(dict(entry, why=why, added_utc=A.utc()))
+    save(r, f"extract-{key} {' '.join(entry.values())} why={why}")
+    print(f"added to extract {key}: {' '.join(entry.values())}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--list"]:
+        r = load()
+        for e in r["blocked"]:
+            print(f"blocked  {e.get('path')}  {e.get('why', '')}")
+        for e in r["lines"]:
+            print(f"lines    {e.get('path')}  /{e.get('match')}/  {e.get('why', '')}")
+        for e in r.get("extract", {}).get("entries", []):
+            print(f"extract  {e.get('id')}  {e.get('why', '')}")
+        for e in r.get("extract", {}).get("notes", []):
+            print(f"extract  {e.get('id')}-note {e.get('date')}  {e.get('why', '')}")
+        return 0
+    if args[:1] in (["--extract"], ["--extract-note"]):
+        return extract(args)
+    rx = None
+    if args[:1] == ["--lines"] and len(args) == 4:
+        rx, args = args[1], args[2:]
+        try:
+            re.compile(rx)
+        except re.error as e:
+            print(f"refused: --lines {rx!r} is not a regular expression ({e})", file=sys.stderr)
+            return 2
+    if len(args) != 2 or not args[1].strip():
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, why = args[0], " ".join(args[1].split())
+    p = os.path.realpath(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+    root = os.path.realpath(A.ROOT)
+    if not p.startswith(root + os.sep):
+        print(f"refused: {path} is not a path inside the tree", file=sys.stderr)
+        return 3
+    if not os.path.exists(p):   # kit-v0.4.1: blocked before it is made (an instance's intake/ before its first record)
+        print(f"warning: {path} does not exist yet; it is blocked from the moment it does")
+    rel = os.path.relpath(p, root)
+    r = load()
+    entry = {"path": rel, "why": why} if rx is None else {"path": rel, "match": rx, "why": why}
+    key = "blocked" if rx is None else "lines"
+    if any(e.get("path") == rel and e.get("match") == entry.get("match") for e in r[key]):
+        print(f"already on the list: {rel}")
+        return 0
+    entry["added_utc"] = A.utc()
+    r[key].append(entry)
+    save(r, f"{key} {rel}" + (f" match={rx}" if rx else "") + f" why={why}")
+    print(f"added to {key}: {rel}; {len(r['blocked'])} blocked, {len(r['lines'])} line rule(s) on file")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

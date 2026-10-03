@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""bin/manifest — same arguments and same printout as bin/approve, but read-only: approves nothing.
+
+The orchestrator runs this before a user gate so the user sees the exact paths, hashes and digest
+an approval would bind (LESSONS.md "Every launch and every ledger append consumes a byte-bound").
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _approval
+
+if __name__ == "__main__":
+    sys.exit(_approval.approve_main(sys.argv[1:], do_write=False))

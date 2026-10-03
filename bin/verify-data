@@ -1,0 +1,253 @@
+#!/usr/bin/python3
+"""bin/verify-data [--write-lean-manifest]
+
+Prints `root: <the tree>` first, so a command meant for one tree is seen running in another
+(LESSONS.md "A session works on the tree it was opened in"). Then:
+
+Guards data/locked/ (answer keys, control label maps) without reading it as text:
+  1. every file under data/locked/ is hashed; if data/locked/SHA256SUMS exists, the hashes must
+     match it exactly (added / missing / changed files are reported);
+  2. no file anywhere under workspace-*/runs/ or problems/ has the same hash as a locked file
+     (a copied key would be found even under another name);
+  3. no run's input/ contains a file named like a record file (LEDGER.log, CLAIMS.md, HANDOFF.md,
+     ORCHESTRATOR.md, CLAUDE.md) or any other run's BRIEF.md;
+  4. the optional formal-library module matches its master list lean.SHA256SUMS. A claim whose
+     artifact imports the library makes the library part of its evidence, and a per-run copy of a
+     hash list cannot detect a library edit, because editing the library does not touch that copy.
+     This does. `--write-lean-manifest` regenerates the master list, which is the deliberate act of
+     accepting an edit; nothing regenerates it automatically. An instance that links no library
+     skips this check entirely.
+  5. every path HANDOFF.md names in backticks inside this tree exists (LESSONS.md "Every backticked tree path in a handoff exists", after the source's
+     Boyer path error: handoff paths are checked by a script, not by the author's `ls`). A backticked token counts as a
+     path when it starts with a directory of this tree (workspace-N/, problems/, bin/, lean/, handoffs/, tests/,
+     harness/, .claude/) or with the tree's absolute root; tokens with placeholders (<, >, *, …, NNN, ⟨) are skipped.
+  6. every outside-input record under intake/ (LESSONS.md "Outside input has an intake record first") is a folder
+     IN-NNN-slug with a unique IN-NNN, a record.md and a SHA256SUMS listing exactly the files under its verbatim/, each
+     with its hash (paths relative to the folder, as `sha256sum verbatim/*` run inside it writes them).
+  7. the instance's environment file, kit-env.json, has no problems (bin/_env.py: refused mount sources, unknown
+     fields; LESSONS.md "A worker's tools come from the user's environment file").
+Prints one line per finding; exit 0 clean, 1 otherwise. Zero-byte files are ignored in (2). Path prefixes listed in
+.verify-data-skip at the root are exempt from (5) (a read-only source, a clone, a mount).
+"""
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+
+def walk(base):
+    for dp, dn, fn in os.walk(base):
+        dn[:] = [d for d in dn if d not in (".lake", "__pycache__")]
+        for f in fn:
+            p = os.path.join(dp, f)
+            if os.path.isfile(p) and not os.path.islink(p):
+                yield p
+
+
+PATH_PREFIXES = ("problems/", "bin/", "lean/", "handoffs/", "tests/", "harness/", ".claude/")
+
+
+def skip_prefixes():
+    """Path prefixes HANDOFF.md may name without the file existing here, one per line in
+    .verify-data-skip at the root: a read-only source, a clone, a mount. Absent: no exceptions.
+    An entry must be a plausible path prefix — at least three characters, no whitespace — so that one
+    stray character cannot silence a whole directory; every entry used is printed with the findings."""
+    out = []
+    try:
+        lines = open(os.path.join(L.ROOT, ".verify-data-skip")).read().splitlines()
+    except OSError:
+        return out
+    for n, line in enumerate(lines, 1):
+        t = line.strip()
+        if not t or t.startswith("#"):
+            continue
+        if len(t) < 3 or any(c.isspace() for c in t):
+            print(f"  .verify-data-skip line {n}: ignoring {t!r} (an entry is a path prefix of 3+ characters, no spaces)")
+            continue
+        out.append(t)
+    return out
+
+
+def intake_findings():
+    """Check 6: the intake records' names, record.md files and hashes."""
+    base = os.path.join(L.ROOT, "intake")
+    out, ids = [], {}
+    if not os.path.isdir(base):
+        return out
+    for name in sorted(os.listdir(base)):
+        d = os.path.join(base, name)
+        if not os.path.isdir(d):
+            continue
+        rel = os.path.relpath(d, L.ROOT)
+        m = re.match(r"^(IN-\d{3})-[a-z0-9][a-z0-9-]*$", name)
+        if not m:
+            out.append(f"intake folder not named IN-NNN-slug: {rel}")
+            continue
+        if m.group(1) in ids:
+            out.append(f"intake id used twice: {m.group(1)} ({ids[m.group(1)]}, {rel})")
+        ids.setdefault(m.group(1), rel)
+        if not os.path.isfile(os.path.join(d, "record.md")):
+            out.append(f"intake record missing: {rel}/record.md")
+        have = {os.path.relpath(p, d): L.sha256(p) for p in walk(os.path.join(d, "verbatim"))}
+        sums = os.path.join(d, "SHA256SUMS")
+        if not os.path.isfile(sums):
+            out.append(f"intake hashes missing: {rel}/SHA256SUMS")
+            continue
+        want = {}
+        for line in open(sums):
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                want[os.path.normpath(parts[1].strip().lstrip("*"))] = parts[0]
+        for f, h in sorted(have.items()):
+            if f not in want:
+                out.append(f"intake file not in SHA256SUMS: {rel}/{f}")
+            elif want[f] != h:
+                out.append(f"intake file changed: {rel}/{f}")
+        for f in sorted(want):
+            if f not in have:
+                out.append(f"intake SHA256SUMS lists a file missing from verbatim/: {rel}/{f}")
+    return out
+
+
+def handoff_paths():
+    """Findings for backticked tree paths in HANDOFF.md that do not exist (check 5)."""
+    import re
+    try:
+        text = open(os.path.join(L.ROOT, "HANDOFF.md"), errors="replace").read()
+    except OSError:
+        return []
+    out, seen = [], set()
+    for tok in re.findall(r"`([^`\n]+)`", text):
+        for t in tok.split():
+            t = t.rstrip(".,;:)").lstrip("(")
+            if t.startswith(L.ROOT + "/"):
+                t = t[len(L.ROOT) + 1:]
+            elif not (re.match(r"^workspace-[0-9]+/", t) or t.startswith(PATH_PREFIXES)):
+                continue
+            if any(x in t for x in ("<", ">", "*", "…", "NNN", "⟨", "$", "{")) or t in seen:
+                continue
+            if any(t.startswith(p) for p in skip_prefixes()):
+                continue   # a read-only source this instance excepted by name, not stat'ed here
+            seen.add(t)
+            if not os.path.exists(os.path.join(L.ROOT, t)):
+                out.append(f"HANDOFF.md names a path that does not exist: {t}")
+    return out
+
+
+def main():
+    # the tree this check is about, first, so a pass on the wrong tree is visible (LESSONS.md "A session works on the tree it was opened in")
+    print(f"root: {L.ROOT}")
+    if "--write-lean-manifest" in sys.argv:
+        if not L.has_lean():
+            print("no formal-library module is linked (no lean/ in this tree); nothing to write")
+            sys.exit(2)
+        mp = L.library_manifest_path()
+        with open(mp, "w") as f:
+            f.write("\n".join(L.library_lines()) + "\n")
+        st = L.library_state()
+        print(f"wrote {os.path.relpath(mp, L.ROOT)}: {st['files']} files, digest {st['digest'][:16]}…")
+        print("this accepts the library as it now stands; re-check any run whose claims predate it")
+        sys.exit(0)
+    findings = []
+    locked = {}
+    show = lambda p: os.path.relpath(p, L.ROOT) if L.inside(p, L.ROOT) else p   # the locked directory may lie outside
+    if os.path.isdir(L.LOCKED):
+        for p in walk(L.LOCKED):
+            if os.path.basename(p) == "SHA256SUMS":
+                continue
+            locked[p] = L.sha256(p)
+        sums = os.path.join(L.LOCKED, "SHA256SUMS")
+        if os.path.isfile(sums):
+            want = {}
+            for line in open(sums):
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    want[os.path.normpath(os.path.join(L.LOCKED, parts[1].strip().lstrip("*")))] = parts[0]
+            for p, h in locked.items():
+                if p not in want:
+                    findings.append(f"locked file not in SHA256SUMS: {show(p)}")
+                elif want[p] != h:
+                    findings.append(f"locked file changed: {show(p)}")
+            for p in want:
+                if p not in locked:
+                    findings.append(f"SHA256SUMS lists a missing file: {show(p)}")
+        elif locked:   # an empty locked directory (a fresh instance) has nothing to lock yet
+            findings.append(f"{show(L.LOCKED)}/SHA256SUMS missing (create with: cd {show(L.LOCKED)} && sha256sum $(find . -type f "
+                            "! -name SHA256SUMS) > SHA256SUMS)")
+    # Pending item P-9 (kit-v0.6.9): with the locked directory outside the tree, a key left in <root>/data/locked is a key
+    # a search from the root can walk. Say so; and still find its copies.
+    legacy, left = os.path.join(L.ROOT, "data", "locked"), {}
+    if os.path.realpath(L.LOCKED) != os.path.realpath(legacy) and os.path.isdir(legacy):
+        left = {p: L.sha256(p) for p in walk(legacy)}
+        if left:
+            findings.append(f"data/locked/ in the tree still holds {len(left)} file(s) while the locked directory is "
+                            f"{L.LOCKED}: the user moves them there (one `!` mv), then re-checks SHA256SUMS")
+    by_hash = {}
+    for p, h in list(locked.items()) + list(left.items()):
+        if os.path.getsize(p) > 0:
+            by_hash.setdefault(h, []).append(p)
+    # P-12 (a medium of the code audit): a copy has its original's size, so only a file of a locked file's size is hashed
+    sizes = {os.path.getsize(ps[0]) for ps in by_hash.values()}
+
+    def role_of(rd):
+        try:
+            return open(os.path.join(rd, ".role")).read().strip()
+        except OSError:
+            return None
+
+    evaluator_inputs = [os.path.join(rd, "input") for rd in L.run_dirs() if role_of(rd) == "evaluator"]
+    scan_roots = [d for d in (os.path.join(L.ROOT, "problems"),) if os.path.isdir(d)] + [os.path.dirname(r) for r in L.run_dirs()]
+    seen = set()
+    for base in scan_roots:
+        if base in seen:
+            continue
+        seen.add(base)
+        for p in walk(base):
+            if os.path.getsize(p) == 0:
+                continue
+            if any(L.inside(p, ei) for ei in evaluator_inputs):
+                continue  # an evaluator run is the one place locked content may legitimately be copied
+            if by_hash and os.path.getsize(p) in sizes:
+                h = L.sha256(p)
+                if h in by_hash:
+                    findings.append(f"LOCKED CONTENT COPIED: {os.path.relpath(p, L.ROOT)} == {show(by_hash[h][0])}")
+    for rd in L.run_dirs():
+        inp = os.path.join(rd, "input")
+        if os.path.isdir(inp):
+            for p in walk(inp):
+                if os.path.basename(p) in L.FORBIDDEN_INPUT_NAMES:
+                    findings.append(f"record-file name in run input: {os.path.relpath(p, L.ROOT)}")
+
+    findings += L.library_drift()
+    findings += L.sage_drift()
+    import _env   # the environment file's own problems (bin/_env.py; LESSONS.md "The environment files are the user's")
+    findings += [f"kit-env.json: {p}" for p in _env.load(L.ROOT).problems]
+
+    # LESSONS.md "`HANDOFF.md` holds the current pointer and nothing else": HANDOFF.md is the current pointer and nothing else, so it can be read whole and
+    # no line limit has to be learned from inside the file it governs. History lives in handoffs/.
+    try:
+        with open(os.path.join(L.ROOT, "HANDOFF.md"), errors="replace") as f:
+            if any(line.startswith("# HISTORICAL") for line in f):
+                findings.append("HANDOFF.md has a HISTORICAL tail again: move it to handoffs/ (every version is archived there anyway)")
+    except OSError:
+        pass
+
+    findings += handoff_paths()
+    findings += intake_findings()
+
+    n_runs = len(L.run_dirs())
+    st = L.library_state()
+    lean = f"lean files: {st['files']} (digest {st['digest'][:16]}…)" if L.has_lean() else "formal library: none linked"
+    skips = skip_prefixes()
+    print(f"locked files: {len(locked)}; runs scanned: {n_runs}; {lean}; findings: {len(findings)}"
+          + (f"; handoff-path exceptions in use: {', '.join(skips)}" if skips else ""))
+    for f in findings:
+        print("  " + f)
+    L.ledger(None, "VERIFY-DATA", f"locked={len(locked)} runs={n_runs} findings={len(findings)}")
+    sys.exit(1 if findings else 0)
+
+
+if __name__ == "__main__":
+    main()

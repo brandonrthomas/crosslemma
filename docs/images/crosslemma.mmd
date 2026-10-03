@@ -1,0 +1,36 @@
+%% crosslemma: one cycle. Rule underneath: whoever produced the work does not get to certify it.
+flowchart TD
+    RULE["<b>The rule underneath:</b> whoever produced the work does not get to certify it"]
+    O1["1 · Orchestrator (an AI session)<br/>writes the brief"]
+    G1("2 · GATE 1 · you approve the manifest<br/>every file's hash, one digest, the exact flags<br/>single use · 30 min")
+    S["3 · Solver · THE PRODUCER<br/>headless Claude Code or Codex, in the sandbox<br/>writes claims.json + artifacts"]
+    C["4 · Checker · a script, not a model<br/>runs each artifact in the same sandbox<br/>pass · fail · n/a"]
+    R["5 · Referees · CERTIFIERS<br/>fresh workers in the sandbox, one typed question each<br/>one from the other model family"]
+    E["6 · Earned tag, computed (first match wins)<br/>FALSIFIED · BLOCKED: not recorded<br/>GAP: recorded as a gap · PENDING: waits<br/>otherwise: earned = claimed"]
+    G2("7 · GATE 2 · you approve the append<br/>of exactly these claim ids and bytes")
+    L[("CLAIMS.md<br/>append-only, never edited")]
+
+    RULE ~~~ O1
+    O1 -- "manifest" --> G1
+    G1 -- "launch: the packet, nothing else" --> S
+    S -- "claims + artifacts" --> C
+    C -- "then referee runs" --> R
+    R -- "verdicts" --> E
+    E -- "only recordable tags" --> G2
+    G2 --> L
+    L -. "handoff, next cycle in a fresh session" .-> O1
+
+    classDef rule fill:#24292f,stroke:#24292f,color:#ffffff
+    classDef user fill:#fff3d6,stroke:#9a6700,color:#1f2328
+    classDef orch fill:#edf3fb,stroke:#0b5cad,color:#1f2328
+    classDef sand fill:#ecf6ef,stroke:#1a7f37,color:#1f2328
+    classDef script fill:#f6f8fa,stroke:#57606a,color:#1f2328
+    classDef comp fill:#f3eefb,stroke:#6f42c1,color:#1f2328
+    classDef rec fill:#eff1f4,stroke:#475569,color:#1f2328
+    class RULE rule
+    class G1,G2 user
+    class O1 orch
+    class S,R sand
+    class C script
+    class E comp
+    class L rec

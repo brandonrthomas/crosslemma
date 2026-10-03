@@ -1,0 +1,728 @@
+#!/usr/bin/python3
+"""bin/new-run WORKSPACE SLUG --role solver [--problem NAME] [--input PATH ...] [--input-approved PATH ...]
+   bin/new-run WORKSPACE SLUG --role referee --claim SOLVER_RUN ID [--question certify|hypotheses|sentence]
+                                                                   [--input PATH ...]
+   bin/new-run WORKSPACE SLUG --role evaluator --input data/locked/... [--input PATH ...]
+   bin/new-run WORKSPACE SLUG --role other
+   every role: [--cpu-hours H] [--threads N] [--mem-gb G] [--harness claude-net|codex|codex-net] [--module NAME ...]
+
+Creates WORKSPACE/runs/NNN-SLUG/{BRIEF.md,input/,scratch/,output/} with NNN = 1 + the highest
+run number across all workspaces (run names are unique project-wide). NNN is added by this tool:
+pass the slug alone ("s9-read", not "087-s9-read"); a slug that starts with digits and a hyphen is refused.
+--harness claude-net|codex|codex-net copies the matching harness note to RUN/HARNESS-NOTE.md, which
+bin/run-external requires for --via codex and for --network (LESSONS.md "Networked and Codex launches need their flags bound"). Writes a BRIEF.md
+skeleton for the role; the orchestrator fills the ⟨slots⟩ before the user's gate.
+
+Refuses to copy anything from data/locked/, any record file (LEDGER.log, CLAIMS.md, HANDOFF.md,
+ORCHESTRATOR.md, CLAUDE.md, another BRIEF.md), and for a solver anything from another run
+(solvers never see prior attempts) unless the user excepted the file by name: --input-approved. A referee gets exactly: input/claim.json (the one claim),
+input/artifact/... (that claim's artifact and its declared deps), input/PROBLEM.md, input/ledger-premises.md when the
+claim has `ledger` premises (bin/claims-extract --ids; LESSONS.md "A referee is given the ledger entries a claim rests on"),
+and nothing else (--input is refused for a referee); its question, claim and the bytes it was given are recorded in
+data/referee-bindings/<run>.json, outside every run (P-12 C3: the earned tag reads them from there, never from the run).
+--input-approved needs the file's bytes on the user's exceptions list, data/packet-exceptions.json (! bin/packet-except).
+A solver also gets input/validate-claims.py. Every run gets RUN/.limits (--cpu-hours, --threads, --mem-gb: enforced by
+the hook and bin/limits-exec), and with --module, RUN/.modules (a licence module of kit-env.json; bin/run-external
+--module must match it). An evaluator is the only role that may receive data/locked/ inputs
+(label maps, answer keys); it emits scores only. Prints the bin/run-external launch line (LESSONS.md "Every worker is a headless main process":
+no worker is launched as a subagent).
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+import _packet as P
+
+CLAIMS_SCHEMA = '''```json
+{
+  "schema": "kit/claims/2",
+  "run": "⟨RUN⟩",
+  "problem": "⟨PROBLEM⟩",
+  "claims": [
+    {
+      "id": "c1",                      // c1, c2, ... local to this run
+      "tag": "VERIFIED",               // PROVED | VERIFIED | NUMERIC | CONJECTURE | HEURISTIC | GAP
+      "statement": "one exact sentence; state every range and hypothesis",
+      "artifact": {                    // what certifies it; the checker runs it
+        "type": "script",              // script | lean | text | none
+        "path": "output/search.py",    // relative, under output/, never result.md
+        "cmd": "python3 output/search.py",   // script only; run from the run dir; exit 0 = pass
+        "expect_stdout_contains": "count=17\\n",  // optional; also expect_exit, expect_stdout_sha256; end the value
+                                       // (here a newline): "count=17" alone would also match count=170
+        "deps": ["output/cases.txt"],  // every other file under output/ the artifact needs; INSIDE artifact
+        "mutations": [                 // VERIFIED script claims: at least one; each perturbs a COPY of the
+          {"name": "drop-one-case",    // evidence under scratch/ and re-runs the checker on the copy,
+           "cmd": "cp -r output/data scratch/mut && sed -i 1d scratch/mut/cases.txt && python3 output/search.py scratch/mut",
+           "expect_stdout_contains": "FAIL count"}   // the FAIL line the targeted part prints
+        ]                              // the checker MUST then exit non-zero AND print that line
+      },
+      "range": "all n <= 10^6",         // VERIFIED, NUMERIC
+      "coverage": "exhaustive enumeration; the script prints the count of cases visited and asserts it equals the closed form",  // VERIFIED
+      "silent_links": ["enumeration completeness: relies on lemma L in output/proof-c1.md"],  // PROVED, VERIFIED; ["none"] if none
+      "premises": [                    // PROVED, VERIFIED: everything the claim rests on besides its artifact
+        {"kind": "software", "what": "Python 3.12 integers; no other package"}
+      ],                               // kinds: kernel | classical | published | source | ledger | software
+      "supersedes": null
+    }
+  ]
+}
+```
+Lean artifacts: `"type": "lean", "path": "output/X.lean", "decls": ["thm_name"]`, and
+`"native_decide": true` if any declaration uses it. If the artifact needs other files you
+wrote (a lemma file, a data file), list them inside the artifact object:
+`"artifact": {"type": "text", "path": "output/proof.md", "deps": ["output/lemmas.md"]}`. A `deps` outside the
+artifact object is an error (input/validate-claims.py reports it). A referee sees the artifact, its deps,
+and the problem statement, nothing else. Text artifacts (`"type": "text"`) are a
+self-contained proof or evidence file under output/; a referee reads it with only PROBLEM.md.
+Other required fields by tag: CONJECTURE needs `evidence` and `counter_pressure`; HEURISTIC
+needs `nonrigorous_step`; GAP needs `must_show`. A claim missing its required fields fails
+the check and is not recorded.
+Statement rule: write the `statement` from what the artifact actually establishes, never from a
+description or summary of it. A hypothesis you leave out because it follows from the others is left
+out, not carried, unless you supply the derivation; and if you describe an object by some property
+instead of the definition your declaration uses, cite the bridge. For a `lean` artifact that means reading the formal statement of
+every declaration in `decls` and carrying each of its hypotheses into the English sentence; a
+quantifier in the English wider than the theorem's is an overclaim and a referee will find it.
+Coverage rule: a VERIFIED or NUMERIC claim over a stated range needs a checker that FAILS when
+the range is truncated. Declare that as `mutations` (a checker that only prints counts does not
+certify them). A coverage claim without at least one mutation test is NUMERIC, not VERIFIED.
+A coverage count written into the script after a first run printed it is not a certificate: derive
+it independently (a closed form, a second method) or say in `coverage` that it was frozen after a run.
+Kill rule: each mutation names, in `expect_stdout_contains`, the FAIL line its targeted part prints;
+it kills only when the checker exits non-zero AND prints that line, so a crash, or a failure of
+another part, is not a kill. Print FAIL lines with print(): sys.exit("FAIL ...") and an assert's
+message go to stderr, where the checker does not look. No part's FAIL line may occur inside
+another's ("FAIL count" is found in "FAIL count2"): end each with a delimiter or give distinct names.
+Every count or value a sentence states is asserted by the script against
+a value fixed before it runs (a closed form, an independent count, a value written down first), not
+only printed. In output/result.md, map each claim's asserted parts in a table:
+| asserted part | check | mutation that kills it |
+one row per part, so a reader sees which mutation exercises which assertion.
+Premises rule: `premises` lists everything a PROVED or VERIFIED claim rests on besides its artifact,
+one object each: `kernel` (Lean and Mathlib), `classical` (a textbook fact, cited), `published` (a
+theorem of a paper or book), `source` (a statement of a note taken as stated), `ledger` (one C-NNN of
+the record, if your inputs cite one), `software` (a package whose output the claim trusts). A
+`published` or `source` premise must be the PRIMARY text, not a restatement of it in some other
+source: give `"source"` (the text itself, copied under output/, e.g. from input/) and `"quote"` (a
+file under output/ quoting the statement you use verbatim, with page, section or line numbers), and
+list both in `artifact.deps`. Use a premise only as quoted; a stronger or differently hypothesised
+form is a different premise. If the primary text is not in your inputs, the step is a [GAP].
+Computer algebra rule: a claim resting on PARI/GP, cypari2, mwrank, Singular, Macaulay2, msolve or
+SageMath is VERIFIED only if an exact script that does NOT use that package re-checks a certificate
+the package produced (points, maps, identities, Groebner or rational certificates), or two
+independent packages agree on the fact; otherwise it is NUMERIC. Name the package in `silent_links`
+and as a `software` premise either way.'''
+
+SOLVER_BRIEF = '''# Run {run}: ⟨one-line title⟩
+
+Your run directory is {rd}
+Read only what is in it. Work alone. Everything you write goes under output/ or scratch/.
+
+## Task
+⟨What to attempt, precisely. Which variant of the problem in input/PROBLEM.md. What counts as
+done. No prior attempts are described here on purpose. Numbered phases; each phase names its
+deliverable file under output/.⟩
+
+### Gates
+⟨Each gate: what must pass before the next phase starts, the exact pass criterion (a number,
+a re-found known object, a verified certificate), and what a failed gate ends: "S6 not passed
+→ no S7, no search; report every attempt". A gate is not a suggestion. Write "none" if the
+task has a single phase.⟩
+
+### Frozen before running
+⟨Everything that must be fixed and written to output/ (and `ledger`ed) BEFORE the batch that
+uses it runs: configuration, seeds, number of starts predeclared from measured cost, thresholds,
+denominator bounds. Post-hoc changes are reported as post-hoc, outside the frozen protocol.⟩
+
+### Classes every start ends in
+⟨The exhaustive, disjoint list of outcomes a unit of work (a start, a case, a candidate) can
+end in, each with its recorded fields, e.g. EXACT (verified certificate) / NUMERIC-ONLY
+(residual < 1e-10, recognition failed; entries, residual, max entry) / PLATEAU / DRIFT / CAP.
+Every table row carries exactly one class. Write "n/a" for a non-search task.⟩
+
+## Inputs
+{inputs}
+
+## Budget
+Enforced by the sandbox, not by you (no need to promise them): {threads} compute threads
+(BLAS/OpenMP pools are capped by environment; `$KIT_THREADS`), {cpu_hours} CPU-hours for
+the whole run (the run is stopped when its whole process tree has used them), {mem_gb} GB
+memory, `ulimit -t` per command. Also: at most ⟨N⟩ tool calls,
+⟨G⟩ GiB of new files, no network, no installs.
+| phase | elapsed allocation | ends on |
+|---|---|---|
+| ⟨1 name⟩ | ⟨h:mm⟩ | ⟨gate or kill criterion⟩ |
+| ⟨2 name⟩ | ⟨h:mm⟩ | ⟨…⟩ |
+| deliverables (reserve) | ⟨0:20⟩ and ⟨10⟩ calls | always |
+| **global** | **⟨h:mm⟩** | ⟨= the sum of the rows above at most⟩ |
+Long computations run in the foreground, one command per call, each with an explicit timeout (at most an
+hour per call), and write progress to files under scratch/ or output/. Every command ends with its call, and
+everything it started ends with it: no job outlives a call (the shell tool's background option is off here, and a
+job started with `&` dies with its command). Split a computation longer than an hour into resumable parts, each
+saving its state to a file the next part reads. You run headless: when you end your turn, the run ends, so write
+your deliverables before you end it.
+Any reached limit closes the run once deliverables are written.
+
+## Kill criteria
+⟨Conditions under which you stop and report a negative, one per phase, named K-a, K-b, …:
+"if the search to 10^6 finds no object, stop; do not extend the range." A negative with a
+reason is a complete report; nothing is queued.⟩
+
+## Cycle exit criteria
+E1. `output/result.md` and `output/claims.json` delivered in the schema below, artifact commands
+    reproducible from the run directory, every helper and evidence file the artifacts need listed
+    in `artifact.deps`. Last thing before you finish: run `python3 input/validate-claims.py` and fix every
+    ERR it prints until it says CLEAN (WARN lines are advisory; read them). E2 onward each marked
+    passed, failed or not reached.
+⟨E2… copied from the orchestrator's cycle record. Mechanical, e.g. "c1 earns VERIFIED or is
+falsified", so the orchestrator can check them at step 6 without judgement.⟩
+
+## Rules
+- Every mathematical statement carries exactly one tag: [PROVED] [VERIFIED] [NUMERIC]
+  [CONJECTURE] [HEURISTIC] [GAP]. An argument containing a [GAP] is not a proof.
+- Do not write proves, shows, establishes, therefore, it follows, clearly, obviously, WLOG on a
+  line that has no tag. A qualifier inside the brackets is fine: [PROVED, sketch].
+- Exact arithmetic (integers, rationals). Any float needs a stated error bound the conclusion survives.
+- Before believing a search finds nothing, make it re-find something known and say so.
+- Prior art: you have no network. Say what you would have searched for; do not call anything new.
+- Log decisions and findings as you go: `ledger "..."`.
+
+## Output (the deliverable; the run is incomplete without both files)
+1. `output/result.md`, at most 150 lines: what you did, what you found, each statement tagged,
+   what you killed and why. Proofs and evidence go in separate files under output/, not here.
+2. `output/claims.json` exactly in this schema (one entry per statement you want recorded):
+
+{schema}
+'''
+
+REFEREE_BRIEF = '''# Run {run}: referee one claim
+
+Your run directory is {rd}
+Read only what is in it. Work alone.
+
+You are refereeing a single mathematical claim. You see the claim (input/claim.json), its
+artifact and any files the claim lists as deps (input/artifact/), and the problem statement
+(input/PROBLEM.md). Nothing else exists
+for you. You do not know who made the claim or what else they did.
+{network_note}
+## Task
+Decide whether the artifact certifies the statement at the stated tag.
+{formal_bullet}- `script` artifact: read the code; decide whether what it computes is what the statement
+  claims (range, completeness of the enumeration, symmetry/double counting, exact arithmetic,
+  boundary cases). You may run it.
+- `text` artifact: check the argument line by line for gaps. A step you cannot verify is a gap.
+{library_note}Try to derive the negation. If that feels as easy, say so under `gap`.
+{premises_note}If the artifact certifies LESS than the English statement says (a narrower range, fewer cases, a weaker
+conclusion, a value that is printed but never checked), the verdict is `gap`, not `holds` with a caveat: put the
+sentence the artifact does support in the note.
+{long_checks}
+## Output: `output/referee.json`, exactly this and nothing more
+```json
+{{
+  "schema": "kit/referee/1",
+  "run": "{solver_run}",        // exactly this value: the run the claim came from, NOT your run
+  "claim": "{claim_id}",        // exactly this value
+  "verdict": "holds",           // holds | falsified | gap | unverifiable
+  "pointer": "input/artifact/proof-c1.md:L42",   // the one place your verdict rests on
+  "note": "at most 3 lines AND at most 600 characters in total"
+}}
+```
+A note over 3 non-empty lines or over 600 characters makes the whole file INVALID and your
+verdict does not count; put the one decisive fact in the pointer and keep the note short.
+`falsified` needs a concrete counterexample or a false step in the pointer. `gap` names what
+is missing. `unverifiable` means you could not decide with what you have; say why in one line.
+Nothing you write outside output/referee.json is read by anyone. Then run `ledger "referee done"`.
+'''
+
+REFEREE_BRIEF_HYPOTHESES = '''# Run {run}: referee one claim — the omitted-hypothesis read
+
+Your run directory is {rd}
+Read only what is in it. Work alone.
+
+You are checking ONE thing about ONE claim: does the English statement in input/claim.json carry
+every restriction the artifact actually needs? You are NOT judging whether the artifact is
+correct, whether the proof works, or whether the result matters. A separate reader has that job.
+Yours is narrower and mechanical, and it is the one that catches a claim asserting more than it
+proved.
+
+You see the claim (input/claim.json), its artifact and any files the claim lists as deps
+(input/artifact/), and the problem statement (input/PROBLEM.md). Nothing else exists for you.
+{network_note}
+## Task
+1. Enumerate the artifact's restrictions exhaustively, in writing; scratch/ is yours.
+   - `lean`: for EVERY declaration named in the claim's artifact.decls, list every hypothesis of
+     its formal statement, implicit binders and instance arguments included, and state exactly what
+{formal_bullet_hyp}   - `script`: list what the code actually ranges over, and every cap, cutoff, early exit, assumed
+     input, hard-coded constant and skipped case.
+   - `text`: list every hypothesis the argument uses, including the ones it uses without saying so.
+{library_note}2. For each restriction, point at the words of the English statement that carry it.
+3. Report every restriction with no counterpart. A restriction the artifact needs and the English
+   does not state is an omitted hypothesis: the claim asserts more than the artifact supports.
+
+Traps worth checking by name: an English quantifier ("every", "any", "all", "no ... at all") wider
+than the formal statement; a list of cases in the English longer than the cases the artifact
+covers; positivity, distinctness, primality, coprimality or nonzero conditions present formally and
+absent in the English; a range stated in the English as unbounded; a claim about a general object
+proved only for a sub-case; the English describing an object by some equivalent property instead of
+the definition the declaration actually uses.
+
+**What counts as supplied.** The supplied material is: the claim, the artifact, the declarations the
+claim cites, the statements of those declarations, and the definitions those statements mention,
+unfolded. Nothing else is supplied. In particular no other theorem of a library the artifact imports
+is supplied, however easily you could find it, and a proof you write yourself supplies nothing.
+
+**Two rules decide the close calls. Apply them literally.**
+
+1. A hypothesis counts as carried only if the English states it, or the supplied material derives it.
+   Ordinary notation and unfolding a definition count as stating it. Deriving it yourself does not,
+   however short the derivation would be: if nothing supplied gives the step, that is a `gap`.
+2. A `silent_links` entry names an obligation; it does not discharge one. Where the English describes
+   an object by some property instead of the definition a cited declaration uses, a cited declaration
+   must state the bridge between them. Composing uncited library lemmas yourself does not supply it,
+   and neither does checking your own composition in Lean: that is a `gap` even though the link was
+   declared.
+
+Neither rule asks whether the English is true. A sentence can be perfectly true and still not be
+what the artifact you were given establishes; that is the whole of what you are checking.
+{premises_note}An artifact that establishes less than the English says is a `gap`, never `holds` with a caveat; put the
+sentence it does support in the note.
+{long_checks}
+## Output: `output/referee.json`, exactly this and nothing more
+```json
+{{
+  "schema": "kit/referee/1",
+  "run": "{solver_run}",        // exactly this value: the run the claim came from, NOT your run
+  "claim": "{claim_id}",        // exactly this value
+  "verdict": "holds",           // holds | falsified | gap | unverifiable
+  "pointer": "input/artifact/proof-c1.lean:L42",  // where the worst omitted hypothesis lives
+  "note": "at most 3 lines AND at most 600 characters in total"
+}}
+```
+`holds` — every restriction the artifact needs is carried by the English statement.
+`gap` — at least one is not. Name them in the note, worst first.
+`falsified` — the English asserts something the artifact contradicts outright.
+`unverifiable` — you could not read the artifact's formal statement; say why in one line.
+A note over 3 non-empty lines or over 600 characters makes the whole file INVALID and your verdict
+does not count. Nothing you write outside output/referee.json is read by anyone.
+Then run `ledger "referee done"`.
+'''
+
+
+REFEREE_BRIEF_SENTENCE = '''# Run {run}: referee one claim — the sentence read of a script claim
+
+Your run directory is {rd}
+Read only what is in it. Work alone.
+
+You are checking ONE thing about ONE claim backed by a script: does the English sentence in input/claim.json say
+exactly what the script establishes, no more? You see the claim (input/claim.json, with its `range`, `coverage`,
+`silent_links`, `premises` and `artifact.mutations`), the script and every file it lists as deps (input/artifact/),
+and the problem statement (input/PROBLEM.md). Nothing else exists for you. You may run the script and its mutation
+commands; the claim's paths are relative to the solver's run, so adjust them to input/artifact/.
+{network_note}
+## Task
+Enumerate in writing (scratch/ is yours), then decide:
+1. **What the checker asserts.** The script's exit conditions: every assert, every check that makes it exit non-zero;
+   and the claim's `artifact.expect_exit`, `expect_stdout_contains` and `expect_stdout_sha256`, which the checker
+   enforces on the script's output. `expect_stdout_contains` is a substring test, so a printed value one of them pins
+   is asserted only if the pin ends the value (a newline, space or word after it: "count=17" alone also matches
+   "count=170") or it is `expect_stdout_sha256`. A value the script only prints, and nothing pins so, is not asserted.
+2. **What the English says.** Split the sentence into its separate assertions, each with its range.
+3. **Match.** Every assertion of the English must be one the checker asserts, on exactly the stated range. An
+   assertion the script only prints and nothing pins, a range wider than the one enumerated, a case skipped, a cap or early exit the
+   English does not state: each is a `gap`.
+4. **Mutations.** For each assertion of the English, is there a declared mutation that would make the checker fail if
+   that assertion were false? An assertion no mutation exercises is named in your note; if it is the claim's range or
+   coverage, that is a `gap` (a coverage claim without a failing mutation is NUMERIC, not VERIFIED).
+5. **Counts.** A coverage count asserted by the script, or pinned by an `expect_*` field, that was written in after a first run printed it, with no
+   independent derivation (a closed form, a second method), is a `gap` unless `coverage` says it was frozen after a run.
+6. **Packages.** If the script uses PARI/GP, cypari2, mwrank, Singular, Macaulay2, msolve or SageMath, a VERIFIED tag
+   needs either an exact re-check of a certificate the package produced, by code that does not use the package, or
+   two independent packages agreeing on the fact; otherwise the claim is at most NUMERIC, and a VERIFIED tag is a `gap`.
+{premises_note}{long_checks}
+## Output: `output/referee.json`, exactly this and nothing more
+```json
+{{
+  "schema": "kit/referee/1",
+  "run": "{solver_run}",        // exactly this value: the run the claim came from, NOT your run
+  "claim": "{claim_id}",        // exactly this value
+  "verdict": "holds",           // holds | falsified | gap | unverifiable
+  "pointer": "input/artifact/check.py:L42",   // where the worst mismatch lives
+  "note": "at most 3 lines AND at most 600 characters in total"
+}}
+```
+`holds` — the English says exactly what the script asserts, on its range, and every point above passes.
+`gap` — at least one does not: name them in the note, worst first, and give the sentence the script does support.
+`falsified` — the script, run as given, contradicts the English.
+`unverifiable` — you could not run or read the script; say why in one line.
+A note over 3 non-empty lines or over 600 characters makes the whole file INVALID and your verdict does not count.
+Nothing you write outside output/referee.json is read by anyone. Then run `ledger "referee done"`.
+'''
+
+# LESSONS.md "Premises on every claim; the primary text quoted; a conditional marker": every referee question checks the claim's premises the same way.
+PREMISES_NOTE = """  The claim's `premises` list what it rests on besides the artifact. For each `published` or `source`
+  premise, open its `source` and `quote` files (they are among your inputs): the quoted statement must appear in the
+  source at the stated place, and the artifact must use it only as quoted. A premise the artifact uses that is not
+  listed, or uses in a stronger or differently hypothesised form than quoted, is a `gap`.
+"""
+
+
+# LESSONS.md "A networked referee's brief carries the network paragraph": a networked referee (--harness claude-net or
+# codex-net) gets the paragraph the source first wrote by hand for seventeen of its runs, built in.
+NETWORK_NOTE = """
+**Network (this run only).** You have web access, for one purpose: to read the published sources the artifact cites
+for theorems it uses without proof, and to compare each cited statement, with all its hypotheses, with how the artifact
+uses it. Log every query and URL in output/search-log.md and save what you download under downloads/. A cited theorem
+you cannot reach is a step you cannot verify. A cited source supplies only what the artifact cites it for; nothing
+else you find on the web is part of the material you are judging.
+"""
+
+
+# LESSONS.md "A headless referee finishes its checks in its turn": a referee that ends its turn to wait on background jobs
+# ends the run with no verdict (the source's run 203); the paragraph the source wrote by hand into two later briefs, now in
+# every referee brief. Since kit-v0.6.20 a worker's commands run in the foreground only (P-15), and it says so.
+LONG_CHECKS_NOTE = """
+**Long checks.** You run headless: when you end your turn, the run ends. Run every check in the foreground, one
+command per call, with an explicit timeout (at most an hour per call): every command ends with its call, and no job
+outlives it (the shell tool's background option is off here, and a job started with `&` dies with its command). Split a
+longer check into resumable parts, each saving its state to a file.
+Write output/referee.json before you end your turn.
+"""
+
+
+# LESSONS.md "A referee is given the ledger entries a claim rests on": the source's referees could not compare a premise's
+# quotation with the ledger (three sets, 2026-09-29/30); the entries a claim names as `ledger` premises are now in its packet.
+LEDGER_PREMISES_NOTE = """  For each `ledger` premise, input/ledger-premises.md holds that entry as the ledger has it (a mechanical
+  extract: header, statement, premises): compare every quotation or use of it in the artifact with that statement. An entry
+  the extract does not give is one you cannot check, and a use of it you cannot check is a `gap`.
+"""
+
+
+def ledger_ids(claim):
+    return [p["what"].strip() for p in claim.get("premises") or [] if isinstance(p, dict) and p.get("kind") == "ledger"]
+
+
+def premises_note(claim):
+    return (PREMISES_NOTE + (LEDGER_PREMISES_NOTE if ledger_ids(claim) else "")) if claim.get("premises") else ""
+
+
+# LESSONS.md "A referee of a text claim" (user ruling 2026-09-18, A2 decision item 7): a referee of a TEXT claim must be
+# given, and asked to open, the library definitions the text quotes. Filled into both referee briefs
+# when the claim's artifact type is `text`; empty otherwise.
+LIBRARY_NOTE = """  The shared Lean library is mounted read-only at `$KIT_LEAN/` ({libs}). Where the text quotes or
+  cites a declaration or definition of that library, open it there and compare it with the
+  quotation, character for character where it is a formal statement; a quotation that differs
+  from the library, or a cited declaration you cannot find, goes in your verdict. Opening the
+  library to check a quotation is reading what was supplied; it does not license using library
+  theorems the text does not cite.
+"""
+
+
+FORMAL_BULLET = """- `lean` artifact: check it with `cd "$KIT_LEAN" && lake env lean <abs path>`; then decide
+  whether the formal statement says what the English statement says (hypotheses, ranges,
+  quantifiers, definitions). Axioms are audited by a script; your job is meaning.
+"""
+FORMAL_BULLET_HYP = """     its conclusion says. Check the file with `cd "$KIT_LEAN" && lake env lean <abs path>`;
+     `#check @decl` and `#print decl` are your tools. If a declaration lives in a library the
+     artifact imports, read its statement there.
+"""
+
+
+def formal_bullets():
+    """The proof-assistant paragraphs belong in a brief only where a library module is linked; an instance
+    without one must not tell a referee to check a file against a toolchain it does not have."""
+    return (FORMAL_BULLET, FORMAL_BULLET_HYP) if L.has_lean() else ("", "")
+
+
+def library_note(claim):
+    if (claim.get("artifact") or {}).get("type") != "text" or not L.has_lean():
+        return ""
+    libs = sorted(d for d in os.listdir(L.LEAN_DIR) if not d.startswith(".") and os.path.isdir(os.path.join(L.LEAN_DIR, d)))
+    return LIBRARY_NOTE.format(libs=", ".join(f"`$KIT_LEAN/{d}/`" for d in libs) or "no problem library yet")
+
+
+OTHER_BRIEF = '''# Run {run}: ⟨title⟩
+
+Your run directory is {rd}
+Read only what is in it. Work alone.
+
+## Task
+⟨...⟩
+
+## Output
+⟨exact paths under output/⟩
+'''
+
+
+HARNESS_KINDS = ("claude-net", "codex", "codex-net")
+
+
+def next_number():
+    n = 0
+    for d in L.run_dirs():
+        m = re.match(r"^(\d+)-", os.path.basename(d))
+        if m:
+            n = max(n, int(m.group(1)))
+    return n + 1
+
+
+def refuse_input(p, role):
+    rp = os.path.realpath(p)
+    if not os.path.isfile(rp):
+        L.die(f"input not a file: {p}")
+    if L.in_locked(rp) and role != "evaluator":
+        L.die(f"refusing input from data/locked/: {p}")
+    if os.path.basename(rp) in L.FORBIDDEN_INPUT_NAMES:
+        L.die(f"refusing record file as input: {p}")
+    for rd in L.run_dirs():
+        if L.inside(rp, rd):
+            if role == "solver":
+                L.die(f"refusing input from another run (solvers never see prior attempts): {p}")
+
+
+MADE = {}   # what this invocation made, removed if it fails before the end (P-12: a half-built run was left behind)
+
+
+def undo():
+    if MADE.get("binding") and os.path.isfile(MADE["binding"]):
+        os.remove(MADE["binding"])
+    if MADE.get("rd") and os.path.isdir(MADE["rd"]) and not os.path.islink(MADE["rd"]):
+        shutil.rmtree(MADE["rd"])
+        print(f"new-run: failed; removed the half-built {os.path.relpath(MADE['rd'], L.ROOT)}/", file=sys.stderr)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("workspace")
+    ap.add_argument("slug")
+    ap.add_argument("--role", choices=("solver", "referee", "evaluator", "other"), required=True)
+    ap.add_argument("--problem")
+    ap.add_argument("--input", action="append", default=[])
+    ap.add_argument("--input-approved", action="append", default=[], metavar="PATH",
+                    help="solver only: an input from ANOTHER run's output/, which --input refuses. For files the "
+                         "user has excepted by name, by a ruling. Source path and sha256 go on the NEW ledger "
+                         "line and are printed; the launch approval (bin/approve) then binds the copied bytes.")
+    ap.add_argument("--claim", nargs=2, metavar=("SOLVER_RUN", "ID"))
+    ap.add_argument("--question", choices=("certify", "hypotheses", "sentence"), default="certify",
+                    help="referee question: certify = does the artifact certify the statement (the "
+                         "calibrated brief); hypotheses = does the English carry every restriction "
+                         "the artifact needs. A PROVED claim gets one of each (LESSONS.md 'Two referees per PROVED claim, one per question'). "
+                         "sentence = does a script claim's English say exactly what the script asserts; "
+                         "required for VERIFIED and NUMERIC under claims/2 (LESSONS.md 'A sentence referee reads every script claim').")
+    ap.add_argument("--cpu-hours", type=float, default=8.0, help="enforced CPU budget of the worker's process tree (RD/.limits)")
+    ap.add_argument("--threads", type=int, default=8, help="enforced core cap (cgroup CPU quota) and BLAS/OpenMP thread cap")
+    ap.add_argument("--mem-gb", type=float, default=16.0, help="enforced memory cap of the worker's process tree")
+    ap.add_argument("--harness", choices=HARNESS_KINDS,
+                    help="external route this run is for: copies harness/notes/<kind>.md to RUN/HARNESS-NOTE.md "
+                         "(required by bin/run-external for --via codex and for --network; LESSONS.md 'Networked and Codex launches need their flags bound')")
+    ap.add_argument("--module", action="append", default=[], metavar="NAME",
+                    help="a licence module of kit-env.json this run's worker is to have (bin/_env.py): recorded in "
+                         "RUN/.modules, which bin/run-external --module must match, and named in the brief")
+    a = ap.parse_args()
+    import _env
+    kenv = _env.load(L.ROOT)
+    for m in a.module:
+        if m not in kenv.modules or not kenv.modules[m].on_request:
+            L.die(f"--module {m}: not a licence module of kit-env.json (a module without licence servers is given to every "
+                  "worker with no --module)")
+    if a.cpu_hours <= 0 or a.threads < 1 or a.mem_gb <= 0:
+        L.die("--cpu-hours, --threads, --mem-gb must be positive")
+
+    if not re.match(r"^workspace-\d+$", a.workspace):
+        L.die("workspace must be workspace-N")
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", a.slug):
+        L.die("slug: lowercase letters, digits, hyphens")
+    if re.match(r"^[0-9]+-", a.slug):
+        L.die(f"slug {a.slug!r} starts with a number: bin/new-run adds the run number itself (give the slug alone)")
+    run = f"{next_number():03d}-{a.slug}"
+    if not L.RUN_NAME_RE.match(run):
+        L.die(f"bad run name {run}")
+    rd = os.path.join(L.ROOT, a.workspace, "runs", run)
+    if os.path.exists(rd):
+        L.die(f"{rd} exists")
+
+    solver_rd, claim, problem = None, None, a.problem
+    if a.role == "referee":
+        if not a.claim:
+            L.die("--role referee needs --claim SOLVER_RUN ID")
+        solver_rd = L.resolve_run(a.claim[0])
+        doc = L.load_json(os.path.join(solver_rd, "output", "claims.json"), "solver claims.json")
+        matches = [c for c in doc.get("claims", []) if isinstance(c, dict) and c.get("id") == a.claim[1]]
+        if len(matches) != 1:
+            L.die(f"claim {a.claim[1]} not found once in {os.path.basename(solver_rd)}")
+        claim = matches[0]
+        claim_sha = L.claim_digest(claim)   # before the copy below rewrites its paths (P-12)
+        errs = L.validate_claim(claim, doc.get("schema"))
+        if errs:
+            L.die("claim is malformed; a referee gets only well-formed claims: " + "; ".join(errs))
+        if a.question == "sentence" and claim["artifact"]["type"] != "script":
+            L.die("--question sentence is for script claims (the sentence read of what a script asserts)")
+        problem = problem or doc.get("problem")
+    if a.role in ("solver", "referee") and not problem:
+        L.die("--problem NAME is required (solver) or must be in the solver's claims.json (referee)")
+    if problem:
+        pm = os.path.join(L.PROBLEMS, problem, "PROBLEM.md")
+        if not os.path.isfile(pm):
+            L.die(f"no {pm}")
+    if a.role == "referee" and a.input:   # P-3 B1 (user 2026-10-01): RULES.md §7, a referee sees nothing else
+        L.die("a referee gets no --input: it sees the claim, its artifact and declared deps, the problem statement and the "
+              "ledger entries the claim names as premises (RULES.md §7); a file it needs belongs in the claim's artifact.deps")
+    for p in a.input:
+        refuse_input(p, a.role)
+    if a.input_approved and a.role != "solver":
+        L.die("--input-approved is for --role solver (the role --input refuses other runs' files for outright)")
+    for p in a.input_approved:
+        rp = os.path.realpath(p)
+        if not os.path.isfile(rp):
+            L.die(f"input not a file: {p}")
+        if L.in_locked(rp) or os.path.basename(rp) in L.FORBIDDEN_INPUT_NAMES:
+            L.die(f"refusing: no exception covers data/locked/ or a record file: {p}")
+        if not any(L.inside(rp, os.path.join(d, "output")) for d in L.run_dirs()):
+            L.die(f"--input-approved is for files under another run's output/; use --input for: {p}")
+        # P-3 B2 (user 2026-10-01): the user's exception is a record, not the orchestrator's word: the file's bytes must be on
+        # data/packet-exceptions.json, which only the user writes (! bin/packet-except FILE "ruling"; the hook refuses the rest).
+        if L.sha256(rp) not in P.exceptions():
+            L.die(f"--input-approved: {p} is not on the user's exceptions list (data/packet-exceptions.json, by sha256); the user "
+                  f"excepts it with `! bin/packet-except {os.path.relpath(rp, L.ROOT)} \"<ruling>\"`")
+
+    os.makedirs(os.path.join(rd, "input"))
+    MADE["rd"] = rd   # from here a failure removes what this run made (P-12)
+    os.makedirs(os.path.join(rd, "scratch"))
+    os.makedirs(os.path.join(rd, "output"))
+    with open(os.path.join(rd, ".role"), "w") as f:
+        f.write(a.role + "\n")
+    limits = {"cpu_hours": a.cpu_hours, "threads": a.threads, "mem_gb": a.mem_gb}
+    L.write_json(os.path.join(rd, ".limits"), limits)  # read by the hook (bwrap) and bin/limits-exec
+    copied = []
+    if problem:
+        shutil.copyfile(pm, os.path.join(rd, "input", "PROBLEM.md"))
+        copied.append("input/PROBLEM.md")
+    for p in a.input:
+        dst = os.path.join(rd, "input", os.path.basename(p))
+        if os.path.exists(dst):
+            L.die(f"duplicate input basename {os.path.basename(p)}")
+        shutil.copyfile(p, dst)
+        copied.append("input/" + os.path.basename(p))
+    provenance = []  # LESSONS.md "`--input-approved` puts a user-excepted input": user-excepted inputs from another run, source and hash on the record
+    for p in a.input_approved:
+        dst = os.path.join(rd, "input", os.path.basename(p))
+        if os.path.exists(dst):
+            L.die(f"duplicate input basename {os.path.basename(p)}")
+        shutil.copyfile(p, dst)
+        copied.append("input/" + os.path.basename(p))
+        provenance.append(f"{os.path.relpath(os.path.realpath(p), L.ROOT)}@{L.sha256(dst)[:16]}")
+    if a.harness:
+        src = os.path.join(L.REAL_ROOT, "harness", "notes", a.harness + ".md")
+        shutil.copyfile(src, os.path.join(rd, "HARNESS-NOTE.md"))
+    if a.role == "solver":
+        # LESSONS.md "`bin/validate-claims` is one piece of code": the worker runs the same form validator bin/check uses, inside the sandbox
+        shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "validate-claims"),
+                        os.path.join(rd, "input", "validate-claims.py"))
+        copied.append("input/validate-claims.py")
+    if a.role == "referee":
+        claim["source_run"] = os.path.basename(solver_rd)  # the run the claim came from; referee.json must name it
+        L.write_json(os.path.join(rd, "input", "claim.json"), claim)
+        copied.append("input/claim.json")
+        art = claim["artifact"]
+        if art["type"] != "none":
+            src = os.path.join(solver_rd, art["path"])
+            if not os.path.isfile(src):
+                L.die(f"artifact missing: {src}")
+            if os.path.islink(src) or not L.inside(src, os.path.join(solver_rd, "output")):   # P-12: never through a link
+                L.die(f"artifact is a link or lies outside the solver run's output/: {src}")
+            rel = os.path.relpath(art["path"], "output")
+            dst = os.path.join(rd, "input", "artifact", rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            copied.append("input/artifact/" + rel)
+            claim["artifact"]["path"] = "input/artifact/" + rel
+            new_deps = []
+            for d in art.get("deps") or []:
+                dsrc = os.path.join(solver_rd, d)
+                if not os.path.isfile(dsrc):
+                    L.die(f"deps file missing: {dsrc}")
+                if os.path.islink(dsrc) or not L.inside(dsrc, os.path.join(solver_rd, "output")):
+                    L.die(f"deps file is a link or lies outside the solver run's output/: {dsrc}")
+                drel = os.path.relpath(d, "output")
+                ddst = os.path.join(rd, "input", "artifact", drel)
+                os.makedirs(os.path.dirname(ddst), exist_ok=True)
+                shutil.copyfile(dsrc, ddst)
+                copied.append("input/artifact/" + drel)
+                new_deps.append("input/artifact/" + drel)
+            if new_deps:
+                claim["artifact"]["deps"] = new_deps
+            L.write_json(os.path.join(rd, "input", "claim.json"), claim)
+        if ledger_ids(claim):   # the ledger entries the claim rests on, by bin/claims-extract's rules and exclusions
+            lp = os.path.join(rd, "input", "ledger-premises.md")
+            x = subprocess.run([os.path.join(os.path.dirname(os.path.abspath(__file__)), "claims-extract"), "--ids",
+                                *ledger_ids(claim), "--out", lp], capture_output=True, text=True)
+            if x.returncode != 0:
+                L.die(f"cannot extract the claim's ledger premises: {x.stderr.strip() or x.stdout.strip()}")
+            copied.append("input/ledger-premises.md")
+
+    inputs = "\n".join(f"- `{c}` — " + ("form validator for claims.json and result.md; run it last: `python3 input/validate-claims.py`"
+                                          if c == "input/validate-claims.py" else "⟨what it is⟩") for c in copied) or "- none"
+    if a.role == "solver":
+        brief = SOLVER_BRIEF.format(run=run, rd=rd, inputs=inputs, threads=a.threads,
+                                    cpu_hours=f"{a.cpu_hours:g}", mem_gb=f"{a.mem_gb:g}",
+                                    schema=CLAIMS_SCHEMA.replace("⟨RUN⟩", run).replace("⟨PROBLEM⟩", problem))
+    elif a.role == "referee":
+        tmpl = {"certify": REFEREE_BRIEF, "hypotheses": REFEREE_BRIEF_HYPOTHESES, "sentence": REFEREE_BRIEF_SENTENCE}[a.question]
+        fb, fbh = formal_bullets()
+        brief = tmpl.format(run=run, rd=rd, solver_run=os.path.basename(solver_rd), claim_id=claim["id"],
+                            library_note=library_note(claim), formal_bullet=fb, formal_bullet_hyp=fbh,
+                            premises_note=premises_note(claim), long_checks=LONG_CHECKS_NOTE,
+                            network_note=NETWORK_NOTE if (a.harness or "").endswith("-net") else "")
+        # P-12 C3: the binding is the host's record, outside every run: the question, the claim, the bytes given
+        bart = claim.get("artifact") or {}
+        MADE["binding"] = L.binding_path(run)
+        L.write_binding(run, a.question, os.path.basename(solver_rd), claim["id"],
+                        L.sha256(os.path.join(rd, bart["path"])) if bart.get("type") != "none" and bart.get("path") else None,
+                        {d: L.sha256(os.path.join(rd, d)) for d in bart.get("deps") or []}, claim_sha)
+    else:
+        brief = OTHER_BRIEF.format(run=run, rd=rd)
+    mods = _env.brief_lines(kenv, a.module)
+    if mods:   # the modules this worker will have, as the user described each in kit-env.json
+        section = "## Modules in your sandbox\n" + mods + "\n\n"
+        i = brief.find("\n## ")
+        brief = brief[:i + 1] + section + brief[i + 1:] if i >= 0 else brief + "\n" + section
+    with open(os.path.join(rd, "BRIEF.md"), "w") as f:
+        f.write(brief)
+    if a.module:
+        with open(os.path.join(rd, ".modules"), "w") as f:
+            f.write("\n".join(a.module) + "\n")
+
+    rel = os.path.relpath(rd, L.ROOT)
+    print(f"created {rel}/  role={a.role}" + (f" question={a.question}" if a.role == "referee" else "") + (f"  claim={os.path.basename(solver_rd)}/{claim['id']}" if claim else ""))
+    for c in copied:
+        print(f"  {c}")
+    if a.harness:
+        print(f"  HARNESS-NOTE.md  (harness/notes/{a.harness}.md; the worker sees it; the approval binds it)")
+    if "⟨" in brief:
+        print(f"  BRIEF.md has {brief.count('⟨')} slots to fill before the user's gate")
+    print("\nlaunch (only through the user's approval: bin/manifest, then the user's bin/approve; LESSONS.md 'Every launch and every ledger append consumes a byte-bound'):")
+    model = "fable"
+    if a.harness:  # an external route: bin/run-external only (LESSONS.md 'Networked and Codex launches need their flags bound')
+        via = "codex --model gpt-5.6-sol" if a.harness.startswith("codex") else "anthropic --model fable"
+        net = " --network" if a.harness.endswith("net") else ""
+        print(f"  bin/run-external {run} --via {via} --effort high{net}   (bin/run-external --dry-run first; the approval binds these flags)")
+    else:  # LESSONS.md "Every worker is a headless main process": every worker is headless
+        print(f"  bin/run-external {run} --via anthropic --model {model} --effort high   (bin/run-external --dry-run first; the approval binds these flags)")
+    print(f"  .limits: {a.cpu_hours} CPU-h, {a.threads} threads, {a.mem_gb} GB (enforced by the hook and bin/limits-exec)")
+    for pv in provenance:
+        print(f"  user-excepted input from another run: {pv}")
+    L.ledger(run, "NEW", f"role={a.role} harness={a.harness or '-'} limits={limits} inputs={','.join(copied) or '-'}" + (f" claim={os.path.basename(solver_rd)}/{claim['id']}" if claim else "")
+             + (f" approved-inputs={','.join(provenance)}" if provenance else ""))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException as e:
+        if not (isinstance(e, SystemExit) and e.code in (0, None)):
+            undo()
+        raise

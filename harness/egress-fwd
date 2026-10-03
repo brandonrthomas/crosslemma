@@ -1,0 +1,50 @@
+#!/usr/bin/python3
+"""Runs INSIDE a Codex sandbox that has no network (bin/_ext.py, LESSONS.md "Networked and Codex launches need their flags bound"). The sandbox has its own
+network namespace with only a loopback interface. This listens on 127.0.0.1:PORT there and carries each
+connection to the host's egress proxy through a bind-mounted unix socket. The proxy on the host, outside the
+sandbox, decides what may pass (an allowlist of the model provider's hosts) and logs every request; this
+forwarder decides nothing.
+usage: egress-fwd PORT SOCKET READYFILE"""
+import socket
+import sys
+import threading
+
+port, sock_path, ready = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+
+
+def pipe(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def serve(c):
+    try:
+        u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        u.connect(sock_path)
+    except OSError:
+        c.close()
+        return
+    threading.Thread(target=pipe, args=(c, u), daemon=True).start()
+    threading.Thread(target=pipe, args=(u, c), daemon=True).start()
+
+
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port))
+srv.listen(64)
+open(ready, "w").close()
+while True:
+    c, _ = srv.accept()
+    serve(c)

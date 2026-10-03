@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""bin/lint-brief RUN        (LESSONS.md "Unknown or misplaced fields are errors", after the source's run 086)
+
+Read-only for the run. The packet scan keeps an index of blocked material at .claude/state/packet-index.json (a
+cache, used only when the instance has block rules; the launch path, --packet, rebuilds the index from the files and
+never reads the cache).
+
+Lints a run's BRIEF.md against SCHEMAS.md before the user's gate. Run it before bin/manifest.
+  ERR   an unfilled ⟨slot⟩ of the bin/new-run skeleton
+  ERR   a line that names `deps` without naming `artifact` (outside a ```json block): run 086's brief said
+        "lists it in `deps`" and the worker put deps at the claim's top level, where nothing reads it
+  ERR   a backticked `artifact.x` that SCHEMAS.md §1 does not have
+  WARN  the brief allows more tool calls than bin/run-external's default --max-turns (pass it explicitly)
+  WARN  a HARNESS-NOTE.md for a networked route while the brief says "no network"
+  ERR   the packet (BRIEF.md, HARNESS-NOTE.md, input/) carries blocked material, by bytes or shared text; WARN if it
+        names it (bin/_packet.py; LESSONS.md "No packet carries blocked material")
+  ERR   a route-verdict word ("ranking #7", PARK, PURSUE, DEAD, …) on any line of a packet file, where the instance's
+        data/packet-rules.json has "verdicts" on (the default for a new instance)
+Exit 1 on any ERR.
+bin/lint-brief --packet RUN   the packet scan alone (bin/run-external runs it before touching the approval); exit 1 on a
+                              finding, 4 if the scan itself failed
+"""
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+import _packet as P
+
+DEFAULT_MAX_TURNS = 300  # bin/run-external (user 2026-09-22 14:23: raised from 80)
+
+
+def lint(rd):
+    errs, warns = [], []
+    lines = open(os.path.join(rd, "BRIEF.md"), errors="replace").read().splitlines()
+    in_json = False
+    for n, line in enumerate(lines, 1):
+        if line.strip().startswith("```"):
+            in_json = line.strip().startswith("```json") if not in_json else False
+            continue
+        if "⟨" in line:
+            errs.append(f"BRIEF.md:{n}: unfilled slot: {line.strip()[:90]}")
+        if in_json:
+            continue
+        if re.search(r"\bdeps\b", line) and "artifact" not in line:
+            errs.append(f"BRIEF.md:{n}: names deps without artifact (write artifact.deps): {line.strip()[:90]}")
+        for f in re.findall(r"`artifact\.([A-Za-z_]+)`", line):
+            if f not in L.V.ARTIFACT_FIELDS:
+                errs.append(f"BRIEF.md:{n}: artifact.{f} is not an artifact field of SCHEMAS.md §1")
+    calls = [int(x) for x in re.findall(r"at most (\d+) tool calls", "\n".join(lines), re.I)]
+    if calls and max(calls) > DEFAULT_MAX_TURNS:
+        warns.append(f"the brief allows {max(calls)} tool calls; bin/run-external's default --max-turns is "
+                     f"{DEFAULT_MAX_TURNS}: launch with --max-turns {max(calls)} or more, and bind that flag")
+    hn = os.path.join(rd, "HARNESS-NOTE.md")
+    if os.path.isfile(hn):
+        m = re.search(r"harness: ([a-z-]+)", open(hn, errors="replace").readline())
+        kind = m.group(1) if m else "?"
+        if kind.endswith("net") and re.search(r"\bno network\b", "\n".join(lines), re.I):
+            warns.append(f"HARNESS-NOTE.md is for route {kind} (network) but the brief says 'no network'")
+    pe, pw = P.findings(rd)
+    return errs + ["packet: " + x for x in pe], warns + ["packet: " + x for x in pw]
+
+
+def main():
+    args = sys.argv[1:]
+    packet_only = args[:1] == ["--packet"]
+    args = args[1:] if packet_only else args
+    if len(args) != 1:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    rd = L.resolve_run(args[0])
+    if packet_only:
+        try:
+            pe, pw = P.findings(rd, use_cache=False)   # the launch path: never the orchestrator-writable cache
+        except Exception as e:   # a failed scan is not a finding; exit 4 says which it was
+            print(f"lint-brief --packet: the scan failed: {e!r}", file=sys.stderr)
+            sys.exit(4)
+        errs, warns = ["packet: " + x for x in pe], ["packet: " + x for x in pw]
+    else:
+        errs, warns = lint(rd)
+    for e in errs:
+        print("ERR  " + e)
+    for w in warns:
+        print("WARN " + w)
+    print(f"lint-brief {os.path.basename(rd)}: {len(errs)} error(s), {len(warns)} warning(s)")
+    sys.exit(1 if errs else 0)
+
+
+if __name__ == "__main__":
+    main()

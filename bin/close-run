@@ -1,0 +1,165 @@
+#!/usr/bin/python3
+"""bin/close-run RUN [--no-mutate] [--timeout SEC]
+
+RULES.md steps 2–4 in one command, plus the two lines the orchestrator would otherwise
+compose by hand (LESSONS.md "`bin/close-run` performs steps 2 and 4", 2026-09-16). Never launches anything, never appends to
+CLAIMS.md. In order:
+  1. bin/verify-data                    (hash guard; a finding stops here)
+  2. bin/check RUN --mutate             (artifacts + declared mutation tests; --no-mutate to skip)
+  3. bin/merge RUN                      (verdict table)
+  4. prints: verdict table path; result.md line count and prose flags; a MODEL: line for the run and for each
+     referee run not answered by the one model its approval named; per claim its earned tag and its model-family
+     line; a PROVED claim with only one of the two questions (reported, not refused); for every claimed PROVED
+     claim without a live `holds` referee, the exact `bin/new-run … --role referee --claim RUN ID` lines (certify
+     and hypotheses); for every VERIFIED / NUMERIC claim without a live `sentence` hold, its `--question sentence`
+     line; for every claim missing only the cross-family read, the run to create, launched on a model of the other
+     family (LESSONS.md "A cross-family certify read"); existing CLAIMS.md notes on any id this run supersedes; and the exact
+     `bin/approve --ledger RUN ID…` (the user's) and `bin/ledger-claims RUN ID…` lines for the ids
+     whose earned tag is recordable (not FALSIFIED / BLOCKED / PENDING); the second refuses without the first;
+     and, for any id a claim supersedes, the live entries that depend on it (bin/claim-deps).
+Exit 0 when check passed and nothing is pending; 1 otherwise (the printout says what).
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+BIN = os.path.dirname(os.path.abspath(__file__))
+
+
+def run(cmd):
+    print(f"\n$ {' '.join('bin/' + os.path.basename(c) if c.startswith(BIN) else c for c in cmd)}")
+    p = subprocess.run(cmd, text=True, capture_output=True)
+    sys.stdout.write(p.stdout)
+    if p.stderr.strip():
+        sys.stdout.write(p.stderr)
+    return p.returncode
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("run")
+    ap.add_argument("--no-mutate", action="store_true")
+    ap.add_argument("--timeout", type=int, default=600)
+    a = ap.parse_args()
+    rd = L.resolve_run(a.run)
+    name = os.path.basename(rd)
+    ws = os.path.basename(os.path.dirname(os.path.dirname(rd)))
+    pending = []
+
+    if run([os.path.join(BIN, "verify-data")]) != 0:
+        print("\nclose-run: verify-data reported findings; resolve them before closing anything.")
+        sys.exit(1)
+    chk_rc = run([os.path.join(BIN, "check"), name, "--timeout", str(a.timeout)] + ([] if a.no_mutate else ["--mutate"]))
+    if run([os.path.join(BIN, "merge"), name]) != 0:
+        sys.exit(1)
+
+    chk = L.load_json(os.path.join(rd, "check.json"), "check.json")
+    doc = L.load_json(os.path.join(rd, "output", "claims.json"), "claims.json")
+    claims = [c for c in doc.get("claims", []) if isinstance(c, dict)]
+    checks = {r["id"]: r for r in chk.get("claims", [])}
+    refs = L.referee_files()
+    notes = L.claim_notes() if hasattr(L, "claim_notes") else {}
+
+    print("\n=== close-run summary:", name)
+    md = chk.get("result_md", {})
+    print(f"verdict table : {os.path.relpath(os.path.join(rd, 'verdict.md'), L.ROOT)}")
+    print(f"check overall : {chk.get('overall')}" + (f"; doc errors: {'; '.join(chk['doc_errors'])}" if chk.get("doc_errors") else ""))
+    print(f"result.md     : {'missing' if not md.get('exists') else str(md.get('lines')) + ' lines'}; prose flags: {chk.get('prose_flags', 0)}"
+          + (" (lines " + ", ".join(str(h['line']) for h in md.get('banned_untagged', [])) + ")" if md.get("banned_untagged") else ""))
+    for ln in L.model_lines(rd):   # LESSONS.md "The model a worker ran on is recorded"
+        print(ln)
+
+    recordable, need_ref, single_ref, already, need_sentence, need_cross = [], [], [], [], [], []
+    gids = L.global_ids()
+    for c in claims:
+        cid = c.get("id")
+        cr = checks.get(cid, {"check": "unchecked"})
+        live, _ = L.live_referees(refs.get((name, cid), []), cr, c)
+        verdicts = [r["verdict"] for r in live]
+        sent = L.sentence_need(doc, c, live)
+        cross = L.cross_family_need(rd, doc, c, live)   # LESSONS.md "A cross-family certify read"
+        earned, why = L.earned_tag(c.get("tag"), cr.get("check"), verdicts, *sent, *cross[:2],
+                                   questions=L.proved_questions(live), mutations_missing=bool(cr.get("mutations_missing")))
+        mut = cr.get("mutations")
+        mtxt = f"; mutations {mut['failed_as_expected']}/{mut['n']}" if mut else ("; no mutations declared" if cr.get("mutations_missing") else "")
+        print(f"  {cid:>4} claimed {str(c.get('tag')):<10} check {str(cr.get('check')):<5} earned {earned:<10} ({why}{mtxt})")
+        for ln in L.model_lines(rd, live, run=False):   # its referees'
+            print(f"       {ln}")
+        print(f"       families: {cross[2]}")
+        if earned in ("FALSIFIED", "BLOCKED", "PENDING"):
+            pending.append(f"{cid}: {earned} ({why})")
+            if c.get("tag") == "PROVED" and earned == "PENDING":
+                qs = L.proved_questions(live)
+                if verdicts and all(v == "holds" for v in verdicts) and not {"certify", "hypotheses"} <= qs:
+                    single_ref.append((cid, sorted(qs)))   # P-3 B4: one question holds, the other is missing
+                elif verdicts and all(v == "holds" for v in verdicts):   # only the cross-family read is missing
+                    need_cross.append((cid, "certify", "xcert"))
+                else:
+                    need_ref.append(cid)
+            elif c.get("tag") in ("VERIFIED", "NUMERIC") and earned == "PENDING" and cr.get("check") == "pass":
+                if sent[0] and sent[1]:   # a sentence read holds, from the producer's own family
+                    need_cross.append((cid, "sentence", "xsent"))
+                else:
+                    need_sentence.append(cid)
+        elif (name, cid) in gids:
+            already.append(f"{cid}: already on the record as {gids[(name, cid)]}")
+        else:
+            recordable.append(cid)
+        sup = c.get("supersedes")
+        if sup and notes.get(sup):
+            print(f"       notes on {sup} (superseded by this claim):")
+            for n in notes[sup]:
+                print(f"         - {n}")
+        for ln in L.supersession_lines(sup):   # what else rests on the entry this claim replaces
+            print(f"       {ln}")
+
+    if single_ref:
+        print("\nPROVED claims holding on one question only: [PROVED] needs a live hold on both certify and hypotheses "
+              "(P-3 B4) — create the missing run (launch only on the user's go):")
+        for cid, qs in single_ref:
+            for q, suffix in (("certify", "cert"), ("hypotheses", "hyp")):
+                if q not in qs:
+                    print(f"  bin/new-run {ws} ref-{name.split('-')[0]}-{cid}-{suffix} --role referee "
+                          f"--claim {name} {cid} --question {q}")
+    if already:
+        print("\nAlready on the record (not repeated in the ledger line):")
+        for a_ in already:
+            print("  " + a_)
+    if need_ref:
+        print("\nPROVED claims with no live `holds` referee — create the referee run(s) (launch only on the user's go):")
+        for cid in need_ref:
+            for q, suffix in (("certify", "cert"), ("hypotheses", "hyp")):
+                print(f"  bin/new-run {ws} ref-{name.split('-')[0]}-{cid}-{suffix} --role referee "
+                      f"--claim {name} {cid} --question {q}")
+    if need_sentence:
+        print("\nVERIFIED / NUMERIC claims with no live `sentence` referee that holds — create the run(s) "
+              "(launch only on the user's go):")
+        for cid in need_sentence:
+            print(f"  bin/new-run {ws} ref-{name.split('-')[0]}-{cid}-sent --role referee --claim {name} {cid} --question sentence")
+    if need_cross:
+        print("\nClaims missing the cross-family read — create the run and launch it on a model of the other family than the "
+              "producer's (the families line above; for an unknown producer, the user's ruling first; launch only on the "
+              "user's go; on the Codex route add --harness codex):")
+        for cid, q, suffix in need_cross:
+            print(f"  bin/new-run {ws} ref-{name.split('-')[0]}-{cid}-{suffix} --role referee --claim {name} {cid} --question {q}")
+    if recordable:
+        print("\nAfter the user has read the verdict table, the user approves (LESSONS.md 'Every launch and every ledger append consumes a byte-bound'; the hook keeps "
+              "the orchestrator away from it), then the append:")
+        print(f"  bin/approve --ledger {name} {' '.join(recordable)}")
+        print(f"  bin/ledger-claims {name} {' '.join(recordable)}")
+    else:
+        print("\nNothing recordable yet.")
+    if pending:
+        print("\nNot recordable now:")
+        for p in pending:
+            print("  " + p)
+    L.ledger(name, "CLOSE-RUN", f"check={chk.get('overall')} recordable={','.join(recordable) or '-'} pending={len(pending)}")
+    sys.exit(0 if chk_rc == 0 and not pending else 1)
+
+
+if __name__ == "__main__":
+    main()

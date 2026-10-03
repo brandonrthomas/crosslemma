@@ -1,0 +1,359 @@
+#!/usr/bin/python3
+"""bin/new-workspace DIR --problem SLUG [--lean PATH [--lean-toolchain PATH]] [--sage PATH] [--routes R1,R2,...]
+                        [--env FILE] [--network-keys] [--no-commit]
+
+Makes one instance of the kit for one problem, at DIR (outside the kit), and stops. It never launches anything.
+
+  DIR        the instance directory, absolute or relative to the current directory; must not exist and must not
+             lie inside the kit. Instances live outside the kit, e.g. ~/workspace/<problem>-1.
+  --problem  the problem's slug: lowercase letters, digits, hyphens. problems/<slug>/ is created from the templates.
+  --lean     link a formal-library module: DIR/lean -> PATH (a symlink, never a copy). The toolchain is recorded in
+             DIR/.kit-lean (--lean-toolchain, default ~/.elan); both must exist. Without --lean the instance has no
+             library and every library rule is inert.
+  --sage     link the computer-algebra module: PATH is a SageMath conda environment (it must have bin/sage), recorded
+             in DIR/.kit-sage and mounted read-only for every worker, at its own path. Without --sage workers have
+             whatever /usr holds; RULES.md's computer-algebra rule applies to any package either way.
+  --routes   the run routes the instance enables, comma-separated, from: anthropic, openrouter, codex, and their
+             networked forms anthropic-net, openrouter-net, codex-net. Default: anthropic,codex, a route of each model
+             family, since a PROVED or script claim needs a referee of the other family than its producer's (RULES.md §7);
+             a set of routes of one family only is warned about. Recorded in DIR/.kit-routes,
+             which is what "a canary on every enabled route" means. Each route's credential is named at the end; none
+             is copied, ever.
+  --network-keys   also list where the search gateway's keys go (.env.brave, .env.exa; gitignored). Never created.
+  --env FILE an environment file (bin/_env.py: modules, licence servers, workers' PATH, model families, the CLIs),
+             checked against the new instance before anything is written, then written to DIR/kit-env.json; when it
+             names its own modules, --lean and --sage are added to them as the modules `lean` and `sage`. Its own
+             `locked_dir`, if it has one, names the locked directory.
+
+What it writes: the tools (bin/, harness/, tests/), the hook and agent (.claude/), the two settings files filled from
+their templates (this is the only moment the instance's absolute root is known), the rules (RULES.md, FLOW.md,
+SCHEMAS.md, LESSONS.md, CLAUDE.md, templates/), problems/<slug>/ from the templates, DIRECTION.md, HANDOFF.md, an
+empty append-only LEDGER.log (the chattr command is printed for the user: no sudo here), the locked directory OUTSIDE
+the tree (~/.local/state/crosslemma/<instance>/locked/, mode 0700, refused if it already holds files; pending item P-9),
+kit-env.json recording it as `locked_dir` (always written, with the --env file's fields if one was given),
+data/packet-rules.json (what no worker's packet may carry; the user's, bin/packet-block): DIRECTION.md, HANDOFF.md,
+handoffs/ and intake/ blocked from the start, and "verdicts" on (a route-verdict word in any packet file is an error),
+workspace-1/runs/001-context-canary from the canary template, KIT-VERSION, and one git commit of all of it
+(--no-commit to skip). Then it prints what the user must do before the first run.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+KIT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+ROUTES = ("anthropic", "openrouter", "codex", "anthropic-net", "openrouter-net", "codex-net")
+# per route: the harness note its runs carry (bin/new-run --harness) and the canary's launch flags
+ROUTE_HARNESS = {"anthropic": None, "openrouter": None, "codex": "codex",
+                 "anthropic-net": "claude-net", "openrouter-net": "claude-net", "codex-net": "codex-net"}
+ROUTE_FLAGS = {"anthropic": "--via anthropic --model opus --effort low --max-turns 40",
+               "openrouter": "--via openrouter --model <model id> --effort low --max-turns 40",
+               "codex": "--via codex --model gpt-5.6-sol --effort low",
+               "anthropic-net": "--via anthropic --model opus --effort low --max-turns 40 --network",
+               "openrouter-net": "--via openrouter --model <model id> --effort low --max-turns 40 --network",
+               "codex-net": "--via codex --model gpt-5.6-sol --effort low --network"}
+# LESSONS.md "A cross-family certify read": a claim needs a referee of the other model family, so a new instance enables a route
+# of each by default (kit-v0.4.1, user 2026-09-29); openrouter's family is its --model's, chosen per run.
+DEFAULT_ROUTES = "anthropic,codex"
+ROUTE_FAMILY = {"anthropic": "Anthropic", "anthropic-net": "Anthropic", "codex": "OpenAI", "codex-net": "OpenAI",
+                "openrouter": None, "openrouter-net": None}
+
+
+def family_warning(routes):
+    """A warning when every enabled route runs one model family (none when an openrouter route can run either)."""
+    fams = {ROUTE_FAMILY[r] for r in routes}
+    if None in fams or len(fams) != 1:
+        return None
+    return (f"every enabled route runs one model family ({fams.pop()}): a PROVED or script claim needs a referee of the "
+            "other family (RULES.md §7), so none can earn its tag here without the user's ruling per run")
+
+
+COPY_DIRS = ("bin", "harness", "tests", "templates", ".claude/hooks", ".claude/agents", ".claude/sandbox")
+COPY_FILES = ("RULES.md", "FLOW.md", "SCHEMAS.md", "LESSONS.md", "CLAUDE.md", ".gitignore", ".ignore",
+              ".claude/no-mcp.json", ".claude/settings.template.json", ".claude/worker-net.settings.template.json")
+# What may not be uncommitted in the kit when an instance is made: everything it copies (P-11 (b): .gitignore and .ignore
+# were copied but not checked).
+KIT_DIRTY_PATHS = COPY_DIRS + COPY_FILES
+# The instance's packet rules (bin/_packet.py): what carries opinions of where the answer lies by design is blocked from
+# the start (the direction brief's ranking; the handoffs' account of runs), and so is outside input (intake/, RULES.md
+# "Outside input"); the user adds the rest with bin/packet-block (an evaluator run, when one is made) and excepts a
+# packet that must carry them with bin/packet-except. "verdicts": route-verdict words in any packet file (VERDICT_RE).
+DEFAULT_PACKET_RULES = {
+    "blocked": [{"path": "DIRECTION.md", "why": "the direction brief's ranking of mechanisms (a default)"},
+                {"path": "HANDOFF.md", "why": "the orchestrator's pointer sheet (a default)"},
+                {"path": "handoffs", "why": "archived pointer sheets (a default)"},
+                {"path": "intake", "why": "outside input: operator and orchestrators only (a default)"}],
+    "lines": [], "verdicts": True}
+
+
+def env_file_problems(path, root, lean, sage):
+    """What is wrong with an environment file for the instance at `root` (bin/_env.py), checked before anything is
+    written. A file that names its own modules replaces .kit-lean / .kit-sage, so --lean and --sage beside it are written
+    into the copy as the modules `lean` and `sage` (with_flag_modules)."""
+    sys.path.insert(0, os.path.join(KIT, "bin"))
+    import _env
+    if not os.path.isfile(path):
+        return [f"{path}: not a file"]
+    return list(_env.load(root, path).problems)
+
+
+def commit_paths(lean, sage):
+    """What the first commit holds. kit-env.json always: it records locked_dir since kit-v0.6.9 (P-11 (a); it was committed
+    only with --env, leaving an untracked file)."""
+    paths = list(COPY_DIRS) + list(COPY_FILES) + [".claude/settings.json", ".claude/worker-net.settings.json",
+             "problems", "DIRECTION.md", "HANDOFF.md", "LEDGER.log", ".kit-routes", "KIT-VERSION", "workspace-1",
+             "data/packet-rules.json", "handoffs", "kit-env.json"]
+    if lean:
+        paths += ["lean", ".kit-lean", "lean.SHA256SUMS"]
+    if sage:
+        paths += [".kit-sage"]
+    return paths
+
+
+def locked_plan(envd, root, default=None):
+    """(the environment file's dict with `locked_dir` set, the locked directory's path). A new instance's locked directory
+    lives outside it (pending item P-9, user 2026-10-01): an --env file's own `locked_dir` wins, else
+    ~/.local/state/crosslemma/<instance>/locked (bin/_env.py default_locked_dir)."""
+    sys.path.insert(0, os.path.join(KIT, "bin"))
+    import _env
+    d = dict(envd)
+    if not d.get("locked_dir"):
+        d["locked_dir"] = default or _env.default_locked_dir(root)
+    return d, os.path.realpath(_env.expand(d["locked_dir"], root))
+
+
+def locked_problem(path):
+    """Why `path` cannot be a new instance's locked directory, or None: it must not exist yet, so one instance never takes
+    another's answer keys. The default is keyed by the instance's directory name only, so an empty directory there may
+    be another instance's (the same name under another parent) before its keys arrive (P-12, a low finding)."""
+    if os.path.lexists(path) and not os.path.isdir(path):
+        return "it exists and is not a directory"
+    if os.path.isdir(path) and os.listdir(path):
+        return "it is not empty (another instance's locked data may live there)"
+    if os.path.isdir(path):
+        return ("it already exists, empty (another instance of the same name may use it): remove it, or give kit-env.json "
+                "a locked_dir of its own (--env)")
+    return None
+
+
+def with_flag_modules(d, root, lean, toolchain, sage):
+    """An environment file that names its own modules replaces .kit-lean / .kit-sage (bin/_env.py), so --lean and --sage
+    beside it become modules of the copied file, mounted exactly as those files would have them."""
+    mods = dict(d.get("modules") or {})
+    if lean and "lean" not in mods:
+        mods["lean"] = {"binds": [toolchain, "<root>/lean"], "path": [toolchain + "/bin"],
+                        "env": {"ELAN_HOME": toolchain, "KIT_LEAN": "<root>/lean"}}
+    if sage and "sage" not in mods:
+        mods["sage"] = {"binds": [sage, {"src": "<root>/.claude/sandbox/sage", "dest": "/opt/kit/bin/sage"}],
+                        "env": {"KIT_SAGE": sage}}
+    return dict(d, modules=mods)
+
+
+def die(msg, code=2):
+    print(f"new-workspace: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def fill(text, subs):
+    for k, v in subs.items():
+        text = text.replace(k, v)
+    return text
+
+
+def kit_version():
+    try:
+        sha = subprocess.run(["git", "-C", KIT, "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", KIT, "status", "--porcelain", "--", *KIT_DIRTY_PATHS],
+                               capture_output=True, text=True).stdout.strip()
+        tag = subprocess.run(["git", "-C", KIT, "describe", "--tags", "--exact-match"], capture_output=True, text=True).stdout.strip()
+    except Exception as e:
+        die(f"the kit at {KIT} is not a git repository ({e}); an instance is made at a known kit version")
+    return sha, tag or "-", bool(dirty)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="bin/new-workspace", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("dir")
+    ap.add_argument("--problem", required=True, metavar="SLUG")
+    ap.add_argument("--lean", metavar="PATH")
+    ap.add_argument("--lean-toolchain", metavar="PATH", default=os.path.expanduser("~/.elan"))
+    ap.add_argument("--sage", metavar="PATH")
+    ap.add_argument("--routes", default=DEFAULT_ROUTES)
+    ap.add_argument("--network-keys", action="store_true")
+    ap.add_argument("--no-commit", action="store_true")
+    ap.add_argument("--env", metavar="FILE", help="the instance's environment file (bin/_env.py), copied to DIR/kit-env.json")
+    a = ap.parse_args()
+
+    root = os.path.realpath(a.dir)
+    if root == KIT or root.startswith(KIT + os.sep):
+        die("an instance lives outside the kit")
+    if os.path.exists(root):
+        die(f"{root} exists; an instance is made in a new directory")
+    if not re.match(r"^[a-z0-9][a-z0-9-]*$", a.problem):
+        die("--problem SLUG: lowercase letters, digits, hyphens")
+    routes = [r.strip() for r in a.routes.split(",") if r.strip()]
+    bad = [r for r in routes if r not in ROUTES]
+    if bad or not routes:
+        die(f"--routes: unknown {bad}; choose from {', '.join(ROUTES)}")
+    lean = None
+    if a.lean:
+        lean = os.path.realpath(a.lean)
+        if not os.path.isdir(lean):
+            die(f"--lean {a.lean}: not a directory")
+        if not os.path.isdir(a.lean_toolchain):
+            die(f"--lean-toolchain {a.lean_toolchain}: not a directory (the toolchain the library needs)")
+    sage = None
+    if a.sage:
+        sage = os.path.realpath(a.sage)
+        if not os.path.isfile(os.path.join(sage, "bin", "sage")):
+            die(f"--sage {a.sage}: not a SageMath environment (no bin/sage)")
+    if a.env:
+        probs = env_file_problems(os.path.realpath(a.env), root, lean, sage)
+        if probs:
+            die("--env " + a.env + ": " + "; ".join(probs))
+    envd = json.load(open(a.env)) if a.env else {}
+    envd, locked_path = locked_plan(envd, root)
+    why = locked_problem(locked_path)
+    if why:
+        die(f"the locked directory {locked_path}: {why}; name another as locked_dir in an --env file")
+    sha, tag, dirty = kit_version()
+    if dirty:
+        die("the kit has uncommitted changes in what an instance copies; commit or stash them first (KIT-VERSION must name a commit)")
+    home = os.path.expanduser("~")
+    name = os.path.basename(root)
+    subs = {"@ROOT@": root, "@HOME@": home, "@NAME@": name, "@SLUG@": a.problem, "@KIT@": KIT, "@KITBASE@": os.path.basename(KIT)}
+
+    # ---- the tooling and the rules, copied
+    os.makedirs(root)
+    for d in COPY_DIRS:
+        shutil.copytree(os.path.join(KIT, d), os.path.join(root, d), ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for f in COPY_FILES:
+        os.makedirs(os.path.dirname(os.path.join(root, f)), exist_ok=True)
+        shutil.copyfile(os.path.join(KIT, f), os.path.join(root, f))
+    # ---- the settings, filled: the one moment the absolute root is known
+    for tmpl, live in (("settings.template.json", "settings.json"), ("worker-net.settings.template.json", "worker-net.settings.json")):
+        with open(os.path.join(root, ".claude", tmpl)) as f:
+            text = fill(f.read(), subs)
+        assert "@ROOT@" not in text and "@HOME@" not in text, tmpl
+        with open(os.path.join(root, ".claude", live), "w") as f:
+            f.write(text)
+    # ---- the problem, the direction, the handoff
+    prob = os.path.join(root, "problems", a.problem)
+    os.makedirs(os.path.join(prob, "attacks"))
+    for src, dst in (("templates/PROBLEM.md", "PROBLEM.md"), ("templates/prior-art.md", "prior-art.md")):
+        with open(os.path.join(KIT, src)) as f:
+            text = fill(f.read(), subs)
+        with open(os.path.join(prob, dst), "w") as f:
+            f.write(text)
+    for src, dst in (("templates/DIRECTION.md", "DIRECTION.md"), ("templates/HANDOFF.md", "HANDOFF.md")):
+        with open(os.path.join(KIT, src)) as f:
+            text = fill(f.read(), subs)
+        with open(os.path.join(root, dst), "w") as f:
+            f.write(text)
+    # ---- the record
+    os.makedirs(os.path.join(root, "workspace-1", "runs"))
+    os.makedirs(os.path.join(root, "data"))
+    os.makedirs(locked_path, mode=0o700, exist_ok=True)   # outside the tree (kit-env.json locked_dir; P-9)
+    with open(os.path.join(root, "data", "packet-rules.json"), "w") as f:
+        json.dump(DEFAULT_PACKET_RULES, f, indent=1)
+        f.write("\n")
+    open(os.path.join(root, "LEDGER.log"), "w").close()
+    with open(os.path.join(root, ".kit-routes"), "w") as f:
+        f.write("# run routes this instance enables (bin/new-workspace --routes); a canary precedes real work on each\n")
+        f.write("\n".join(routes) + "\n")
+    if lean:
+        os.symlink(lean, os.path.join(root, "lean"))
+        with open(os.path.join(root, ".kit-lean"), "w") as f:
+            f.write(os.path.realpath(a.lean_toolchain) + "\n")
+        # linking is the deliberate act of accepting the library as it stands: write its master list now
+        m = subprocess.run([os.path.join(root, "bin", "verify-data"), "--write-lean-manifest"], capture_output=True, text=True, cwd=root)
+        if m.returncode != 0:
+            die(f"could not write the library's master list:\n{m.stdout}{m.stderr}")
+    if sage:
+        with open(os.path.join(root, ".kit-sage"), "w") as f:
+            f.write(sage + "\n")
+    if "modules" in envd and (lean or sage):
+        envd = with_flag_modules(envd, root, lean, os.path.realpath(a.lean_toolchain), sage)
+    with open(os.path.join(root, "kit-env.json"), "w") as f:   # always: it records locked_dir (P-9)
+        json.dump(envd, f, indent=2)
+        f.write("\n")
+    with open(os.path.join(root, "KIT-VERSION"), "w") as f:
+        f.write(f"kit-commit: {sha}\nkit-tag: {tag}\nkit-path: {KIT}\nmade: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n"
+                f"problem: {a.problem}\nroutes: {','.join(routes)}\nlean: {lean or '-'}\nsage: {sage or '-'}\n"
+                f"env: {'kit-env.json from ' + os.path.realpath(a.env) if a.env else '-'}\n"
+                "# An instance is upgraded only by a methods session with a diff against this commit, never automatically.\n")
+    # ---- git, then run 001 (new-run needs the tree; its NEW line is the ledger's first)
+    subprocess.run(["git", "init", "-q", root], check=True)
+    first = routes[0]   # run 001 is the first enabled route's canary, with that route's harness note
+    r = subprocess.run([os.path.join(root, "bin", "new-run"), "workspace-1", "context-canary", "--role", "other"]
+                       + (["--harness", ROUTE_HARNESS[first]] if ROUTE_HARNESS[first] else []),
+                       capture_output=True, text=True, cwd=root)
+    if r.returncode != 0:
+        die(f"bin/new-run failed inside the new instance:\n{r.stdout}{r.stderr}")
+    rd = os.path.join(root, "workspace-1", "runs", "001-context-canary")
+    with open(os.path.join(KIT, "templates", "runs", "canary-BRIEF.md")) as f:
+        brief = fill(f.read(), dict(subs, **{"@RUN@": "001-context-canary", "@RUNDIR@": rd}))
+    with open(os.path.join(rd, "BRIEF.md"), "w") as f:
+        f.write(brief)
+    lint = subprocess.run([os.path.join(root, "bin", "lint-brief"), "001-context-canary"], capture_output=True, text=True, cwd=root)
+    if lint.returncode != 0:
+        die(f"the canary brief does not lint:\n{lint.stdout}{lint.stderr}")
+    # the first handoff is archived like every later one, so handoffs/ exists and the history starts at the start
+    ar = subprocess.run([os.path.join(root, "bin", "handoff-archive"), "--session", "new-workspace", "--quiet"], capture_output=True, text=True, cwd=root)
+    if ar.returncode != 0:
+        die(f"could not archive the first handoff:\n{ar.stdout}{ar.stderr}")
+    vd = subprocess.run([os.path.join(root, "bin", "verify-data")], capture_output=True, text=True, cwd=root)
+    if vd.returncode != 0:
+        die(f"a fresh instance must pass its own data check, and this one does not:\n{vd.stdout}{vd.stderr}")
+    committed = "not committed (--no-commit)"
+    if not a.no_commit:
+        subprocess.run(["git", "-C", root, "add", "--"] + commit_paths(lean, sage), check=True)
+        msg = os.path.join(root, ".git", "NEW-WORKSPACE-MSG")
+        with open(msg, "w") as f:
+            f.write(f"new workspace for {a.problem} from kit {sha}\n\nMade by bin/new-workspace; routes {','.join(routes)}; "
+                    f"library {'linked' if lean else 'none'}. Run 001 is the context canary and has not run.\n")
+        c = subprocess.run(["git", "-C", root, "commit", "-q", "-F", msg], capture_output=True, text=True)
+        os.remove(msg)
+        committed = "committed" if c.returncode == 0 else f"NOT committed: {c.stderr.strip()} (set git user.name/user.email and commit by explicit paths)"
+
+    # ---- what the user does next; nothing here is done for them
+    print(f"made {root}  (kit {sha}{'' if tag == '-' else ', tag ' + tag}; {committed})")
+    print(f"  problem   problems/{a.problem}/PROBLEM.md and prior-art.md are templates: fill PROBLEM.md before any brief")
+    print(f"  routes    {', '.join(routes)}  (.kit-routes)")
+    if family_warning(routes):
+        print(f"  WARNING   {family_warning(routes)}")
+    print(f"  library   {'linked: lean -> ' + lean + '; toolchain ' + os.path.realpath(a.lean_toolchain) if lean else 'none'}")
+    print(f"  algebra   {'linked: ' + sage + ' (read-only for workers; .kit-sage)' if sage else 'none'}")
+    print(f"  locked    {locked_path}  (outside the tree; kit-env.json locked_dir; answer keys go here, never in the tree)")
+    print("\nBefore the first run, the user:")
+    print(f"  1. makes the ledger append-only (no sudo is used here):   sudo chattr +a {os.path.join(root, 'LEDGER.log')}")
+    print("  2. places credentials; none was copied:")
+    if any(r.startswith("anthropic") for r in routes):
+        print("       anthropic     the user's own Claude Code login (subscription); nothing to place")
+    if any(r.startswith("openrouter") for r in routes):
+        print("       openrouter    a key file at ~/.config/openrouter/key (or OPENROUTER_KEYFILE=...)")
+    if any(r.startswith("codex") for r in routes):
+        print("       codex         a logged-in ~/.codex/auth.json; a copy lives inside the sandbox for each Codex run")
+    if a.network_keys or any(r.endswith("-net") for r in routes):
+        print(f"       network       search gateway keys, optional: {root}/.env.brave and .env.exa (gitignored; a missing key is")
+        print("                     reported by the gateway, never fatal); a local SearXNG at localhost:7764 if wanted")
+    print("  3. runs the suites inside the instance, once:")
+    for s in ("test_gate", "test_tools", "test_hook_gate", "test_ext"):
+        print(f"       /usr/bin/python3 tests/{s}.py")
+    print("  4. runs the canary on each enabled route, in a fresh session opened in the instance (the hook is live there):")
+    print(f"       run 001 is the {first} route's canary:")
+    print(f"       bin/lint-brief 001-context-canary && bin/manifest 001-context-canary -- {ROUTE_FLAGS[first]}")
+    print(f"       (the user approves those bytes and flags; then) bin/run-external 001-context-canary {ROUTE_FLAGS[first]}")
+    for rt in routes[1:]:
+        h = ROUTE_HARNESS[rt]
+        print(f"       the {rt} route: bin/new-run workspace-1 canary-{rt} --role other" + (f" --harness {h}" if h else "")
+              + f", the canary template again, then the same with {ROUTE_FLAGS[rt]}")
+    print("  5. reads the canary's output/result.md: ESCAPES OR ORACLES FOUND must say none, and Part A must say no.")
+
+
+if __name__ == "__main__":
+    main()

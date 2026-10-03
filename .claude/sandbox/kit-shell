@@ -1,0 +1,36 @@
+#!/bin/bash
+# The shell every command of a Codex worker runs in (LESSONS.md "A Codex worker's commands run apart from Codex"). The
+# Codex sandbox is the worker's sandbox; this puts each command in a second sandbox inside it, with its own process
+# namespace and a fresh /proc, so nothing a command starts can see the Codex process or reach what that process holds
+# open (the transcript pipes, the prompt, the proxy socket), and Codex's home (the user's token, the session log)
+# is an empty tmpfs. Codex's helper links under its home's tmp/ stay reachable, read-only. On a run without the network
+# a command gets no network at all. The run directory and /tmp stay writable; everything else is read-only. When the
+# command ends, the namespace ends, and anything it left running is killed with it.
+# Installed as /opt/kit/bin/bash, first on PATH and the sandbox user's login shell: Codex 0.155 ran its commands as
+# `<bash on PATH> -lc …` and ignored a shell by any other name (canary 006, 2026-09-25). Inside, KIT_CMD_SANDBOXED marks
+# the nested sandbox, so a `bash` started there is the real one, not another layer.
+set -u
+[ "${KIT_CMD_SANDBOXED:-0}" = 1 ] && exec /usr/bin/bash "$@"
+# Without the network a command gets none: its own network namespace, and the egress proxy's socket (Codex's own way to
+# the provider) covered, since a read-only mount does not stop a connect() to a socket (found by the ud orchestrator,
+# 2026-09-26; confirmed in the kit: a command reached the proxy through it).
+net=(--unshare-net --ro-bind /dev/null /opt/kit/egress.sock)
+[ "${KIT_CMD_NET:-0}" = 1 ] && net=()
+# A licence module (bin/_env.py): the command's own network namespace gets, for each licence server, a forwarder on
+# 127.0.0.1:PORT carrying connections to the host's relay through its socket; the relay decides where they go.
+shell=(/usr/bin/bash)
+if [ "${KIT_CMD_NET:-0}" != 1 ] && [ -n "${KIT_LICENCE_FWD:-}" ]; then
+  pre=""; ready=""; i=0
+  for e in $KIT_LICENCE_FWD; do
+    pre+="python3 /opt/kit/bin/egress-fwd ${e%%=*} ${e#*=} /tmp/.lic-$$-$i & "
+    ready+="[ -e /tmp/.lic-$$-$i ] && "; i=$((i + 1))
+  done
+  shell=(/usr/bin/bash -c "${pre}for _ in \$(seq 100); do ${ready}break; sleep 0.1; done; exec /usr/bin/bash \"\$@\"" kit-licence)
+fi
+exec /usr/bin/bwrap --ro-bind / / \
+  --bind /tmp /tmp --bind "$KIT_RUN" "$KIT_RUN" \
+  --tmpfs /opt/codex-home --ro-bind-try /opt/codex-home/tmp /opt/codex-home/tmp \
+  --proc /proc --dev /dev \
+  --unshare-pid "${net[@]}" --die-with-parent \
+  --setenv KIT_CMD_SANDBOXED 1 --chdir "$PWD" \
+  "${shell[@]}" "$@"

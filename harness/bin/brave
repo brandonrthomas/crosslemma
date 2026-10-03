@@ -1,0 +1,4 @@
+#!/bin/bash
+# brave "query" [count]  -> Brave web search JSON, through the key-holding gateway outside the sandbox (bin/_ext.py)
+q=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")
+exec curl -sS --max-time 90 "$GATEWAY/brave?q=$q&count=${2:-10}"

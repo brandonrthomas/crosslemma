@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Launch Claude Code routed at OpenRouter with OpenAI GPT-6 Astra as the session model.
+# The external-orchestrator route: a whole session on another provider's model, started by the user.
+#
+#   bin/astra-session                    interactive session (Astra standard, effort medium)
+#   bin/astra-session -p "prompt" ...    headless; adds --strict-mcp-config + no-mcp.json
+#   ASTRA_EFFORT=max bin/astra-session   override the session effort (low|medium|high|xhigh|max)
+#   ASTRA_MODEL, ASTRA_PRO_MODEL, ASTRA_FABLE_MODEL override the slots below.
+# Interactive mode needs a terminal on stdin (the user's, never an orchestrator's tool call); headless mode needs
+# a user approval of exactly this argv (bin/_approval.py check session astra). Each start writes an EXT-SESSION
+# ledger line. The key is read from $OPENROUTER_KEYFILE (default ~/.config/openrouter/key).
+#
+# Model slots inside the session:
+#   opus   -> openai/gpt-6-astra-pro
+#   fable  -> ~anthropic/claude-fable-latest  (billed through OpenRouter)
+#   sonnet/haiku -> Claude aliases via OpenRouter: Claude Code's own background calls (auto-mode
+#                   classifier, titles) use these slots, so they stay on Claude models.
+# Workers are launched only with bin/run-external, never as subagents (the hook refuses an Agent call of a worker
+# type): model and effort are set per worker, and every CLAUDE* and ANTHROPIC_* variable of this session is dropped
+# before the worker starts, so this session's routing and effort do not reach it.
+#
+# The environment below lives for this one process only. Never export it in a profile:
+# it would route every Claude Code session on this machine through OpenRouter.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+KEYFILE="${OPENROUTER_KEYFILE:-$HOME/.config/openrouter/key}"
+[ -r "$KEYFILE" ] || { echo "astra-session: key file $KEYFILE not readable" >&2; exit 2; }
+KEY=$(tr -d '[:space:]' < "$KEYFILE")
+[ -n "$KEY" ] || { echo "astra-session: key file is empty" >&2; exit 2; }
+
+MODEL="${ASTRA_MODEL:-openai/gpt-6-astra}"
+PRO="${ASTRA_PRO_MODEL:-openai/gpt-6-astra-pro}"
+FABLE="${ASTRA_FABLE_MODEL:-~anthropic/claude-fable-latest}"
+EFFORT="${ASTRA_EFFORT:-medium}"
+
+# Nested launch support: drop every variable the parent Claude Code session set.
+for v in $(env | grep -o '^CLAUDE[A-Z0-9_]*' | sort -u); do unset "$v"; done
+
+mode=interactive; extra=()
+for a in "$@"; do case "$a" in -p|--print) mode=headless;; esac; done
+# LESSONS.md "Every launch and every ledger append consumes a byte-bound": an external orchestrator session is the user's to start. Interactive = a real
+# terminal (an orchestrator tool call has none); headless = a user approval of exactly this argv.
+if [ "$mode" = headless ]; then
+  env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_approval.py" check session astra -- "$@" >/dev/null || exit 3
+elif ! [ -t 0 ]; then
+  echo "astra-session: refused: interactive mode needs a terminal on stdin (user only)" >&2; exit 3
+fi
+if [ "$mode" = headless ]; then
+  extra=(--strict-mcp-config --mcp-config "$ROOT/.claude/no-mcp.json")
+fi
+
+"$ROOT/bin/ledger" EXT-SESSION "astra-session start: mode=$mode base=openrouter model=$MODEL opus=$PRO fable=$FABLE effort=$EFFORT args=$*"
+
+cd "$ROOT"
+exec env \
+  ANTHROPIC_BASE_URL="https://openrouter.ai/api" \
+  ANTHROPIC_AUTH_TOKEN="$KEY" \
+  ANTHROPIC_API_KEY="" \
+  ANTHROPIC_MODEL="$MODEL" \
+  ANTHROPIC_DEFAULT_OPUS_MODEL="$PRO" \
+  ANTHROPIC_DEFAULT_FABLE_MODEL="$FABLE" \
+  ANTHROPIC_DEFAULT_SONNET_MODEL="~anthropic/claude-sonnet-latest" \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL="~anthropic/claude-haiku-latest" \
+  CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
+  CLAUDE_CODE_ATTRIBUTION_HEADER=0 \
+  claude --model "$MODEL" --effort "$EFFORT" "${extra[@]}" "$@"

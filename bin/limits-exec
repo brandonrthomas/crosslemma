@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# bin/limits-exec RUN_DIR -- command args...
+#
+# Runs a command as a worker process tree under the run's enforced limits (LESSONS.md "Limits are enforced, not promised", audit F9):
+#   - RUN_DIR/.limits (JSON written by bin/new-run: {"cpu_hours": H, "threads": N, "mem_gb": G}) →
+#     a transient systemd user scope with CPUQuota=N*100% (the tree cannot use more than N cores'
+#     worth of CPU, whatever the worker spawns) and MemoryMax=G G; defaults 8 / 8 / 16 when absent;
+#   - the whole-run CPU budget (LESSONS.md "The whole-run CPU budget is enforced"; the source's run 346 used 11.13
+#     CPU-hours of 8, only flagged): inside the scope a watcher reads the cgroup's cpu.stat each second; at
+#     cpu_hours it sends TERM to the command (so each route stops in order: timeout passes it to claude, _ext.py
+#     stops Codex as at its other caps), waits cpu_grace_seconds (default 30), then kills every process left in
+#     the scope, background jobs included. Exit 152 (128 + SIGXCPU), cpu_cap_hit=true in usage.json;
+#   - /usr/bin/time -v around the command → RUN_DIR/time.log (user/sys/maxrss of waited-for children);
+#   - the scope's cgroup cpu.stat is read just before the scope ends (from inside it, so still-running
+#     background children are counted too) → RUN_DIR/usage.json {cpu_seconds, user_seconds,
+#     system_seconds, wall_seconds, max_rss_kb, cpu_hours_cap, threads_cap, mem_gb_cap, enforced}.
+# If systemd-run cannot make a user scope (no user manager), the limits cannot be enforced, so nothing runs: exit 2
+# (P-3 B3, user 2026-10-01: RULES.md §9, limits are enforced, not promised). `limits-exec --probe` exits 0 when a user
+# scope can be made and 1 otherwise; bin/run-external asks it before the approval is touched.
+# The scope is named kit-scope-<run>-<pid>; a TERM, INT or HUP to this script stops it, so stopping a detached run's
+# kit-run-NAME service ends the worker too (P-12 H5: the scope lies outside the service's cgroup). The working files
+# stay in a temporary directory of this script's; usage.json and time.log are renamed over the run's names, never
+# written through a link the worker left there (P-12 C2).
+# Exit status is the command's, or 152 when the CPU budget stopped it. Nothing here writes outside RUN_DIR but its own
+# temporary working directory, removed at exit; it writes no ledger line (bin/run-external puts usage.json's figures on EXIT-EXT).
+set -uo pipefail
+can_enforce() { command -v systemd-run >/dev/null 2>&1 && systemd-run --user --scope --quiet -- true 2>/dev/null; }
+NO_SCOPE="limits-exec: refused: no systemd user scope here (systemd-run --user --scope failed), so the run's CPU, thread and memory limits cannot be enforced; nothing was run"
+if [ "${1:-}" = --probe ]; then can_enforce && exit 0; echo "$NO_SCOPE" >&2; exit 1; fi
+[ $# -ge 3 ] && [ "$2" = "--" ] || { echo "usage: limits-exec RUN_DIR -- command... | limits-exec --probe" >&2; exit 2; }
+RD=$(realpath "$1"); shift 2
+[ -d "$RD" ] || { echo "limits-exec: no such dir $RD" >&2; exit 2; }
+can_enforce || { echo "$NO_SCOPE" >&2; exit 2; }
+
+read -r CPU_H THREADS MEM_G GRACE < <(/usr/bin/python3 - "$RD/.limits" <<'EOF'
+import json, sys
+d = {}
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    pass
+def num(k, default, lo, hi):
+    try:
+        v = float(d.get(k, default))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+print(num("cpu_hours", 8, 0.0001, 1000), int(num("threads", 8, 1, 64)), num("mem_gb", 16, 0.5, 512),
+      int(num("cpu_grace_seconds", 30, 1, 600)))
+EOF
+)
+QUOTA=$((THREADS * 100))
+MEMMAX=$(/usr/bin/python3 -c "import sys; print(int(float(sys.argv[1])*1024))" "$MEM_G")   # MiB
+CAP_USEC=$(/usr/bin/python3 -c "import sys; print(int(float(sys.argv[1])*3600*1e6))" "$CPU_H")
+# P-12 C2: the working files (time.log, .cpu.stat, .mem.peak, .cpu.cap) live in a directory of the host's, never in the run
+# directory, where the worker could have left a link at the name; usage.json and time.log reach the run through
+# _lib.write_in_run at the end.
+WD=$(mktemp -d "${TMPDIR:-/tmp}/limits-exec.XXXXXX") || { echo "limits-exec: no working directory" >&2; exit 2; }
+trap 'rm -rf "$WD"' EXIT
+
+T0=$(date +%s.%N)
+ENFORCED=true   # checked above: nothing runs unenforced
+# P-12 H5: the worker's scope lies outside the cgroup of whoever started this script (a detached run's kit-run-NAME
+# service), so stopping that service would not reach it. The scope is named, and a TERM, INT or HUP to this script stops
+# it; the command is waited for in the background so the signal is taken at once.
+SCOPE="kit-scope-$(basename "$RD")-$$"
+trap 'systemctl --user stop "$SCOPE.scope" 2>/dev/null' TERM INT HUP
+{
+  systemd-run --user --scope --unit="$SCOPE" --quiet -p "CPUQuota=${QUOTA}%" -p "MemoryMax=${MEMMAX}M" -p "MemorySwapMax=0" -- \
+    /usr/bin/time -v -o "$WD/time.log" bash -c '
+      WD="$1"; CAP="$2"; GRACE="$3"; shift 3
+      cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)
+      "$@" & child=$!
+      while kill -0 "$child" 2>/dev/null; do
+        u=$(awk "\$1 == \"usage_usec\" {print \$2}" "$cg/cpu.stat" 2>/dev/null)
+        if [ "${u:-0}" -ge "$CAP" ]; then
+          : > "$WD/.cpu.cap"
+          kill -TERM "$child" 2>/dev/null
+          end=$((SECONDS + GRACE))
+          while kill -0 "$child" 2>/dev/null && [ "$SECONDS" -lt "$end" ]; do sleep 0.5; done
+          case "$cg" in   # only this run'"'"'s own transient scope: a wrong cgroup here would reach other processes
+            */kit-scope-*.scope)
+              for p in $(cat "$cg/cgroup.procs" 2>/dev/null); do   # all but this shell and its parent (time, the scope'"'"'s main)
+                [ "$p" = "$$" ] || [ "$p" = "$PPID" ] || kill -KILL "$p" 2>/dev/null
+              done;;
+            *) echo "limits-exec: $cg is not this run'"'"'s transient scope; nothing beyond the command was ended" >&2;;
+          esac
+          break
+        fi
+        sleep 1
+      done
+      wait "$child"; rc=$?
+      [ -e "$WD/.cpu.cap" ] && rc=152
+      cat "$cg/cpu.stat" > "$WD/.cpu.stat" 2>/dev/null
+      cat "$cg/memory.peak" > "$WD/.mem.peak" 2>/dev/null
+      exit $rc' _ "$WD" "$CAP_USEC" "$GRACE" "$@" <&0 &
+  CHILD=$!
+  wait "$CHILD"; RC=$?
+  while kill -0 "$CHILD" 2>/dev/null; do wait "$CHILD"; RC=$?; done   # a signal ended the wait, not the command
+}
+T1=$(date +%s.%N)
+
+/usr/bin/python3 - "$RD" "$T0" "$T1" "$RC" "$CPU_H" "$THREADS" "$MEM_G" "$ENFORCED" "$WD" "$(dirname "$(realpath "$0")")" <<'EOF'
+import json, os, re, sys
+rd, t0, t1, rc, cpu_h, threads, mem_g, enforced, wd, bindir = sys.argv[1:]
+sys.path.insert(0, bindir)
+import _lib as L
+u = {"wall_seconds": round(float(t1) - float(t0), 1), "exit": int(rc), "enforced": enforced == "true",
+     "cpu_hours_cap": float(cpu_h), "threads_cap": int(threads), "mem_gb_cap": float(mem_g)}
+try:
+    st = dict(l.split() for l in open(os.path.join(wd, ".cpu.stat")) if len(l.split()) == 2)
+    u["cpu_seconds"] = round(int(st["usage_usec"]) / 1e6, 1)
+    u["user_seconds"] = round(int(st["user_usec"]) / 1e6, 1)
+    u["system_seconds"] = round(int(st["system_usec"]) / 1e6, 1)
+    u["cpu_source"] = "cgroup"
+except Exception:
+    pass
+try:
+    u["peak_rss_kb_tree"] = int(open(os.path.join(wd, ".mem.peak")).read()) // 1024
+except Exception:
+    pass
+try:
+    tl = open(os.path.join(wd, "time.log")).read()
+    L.write_in_run(rd, "time.log", tl)   # what time -v wrote, over anything the worker left at the name
+    m = lambda k: re.search(k + r".*?:\s*([\d.]+)", tl)
+    if "cpu_seconds" not in u:
+        us, sy = m(r"User time"), m(r"System time")
+        if us and sy:
+            u["user_seconds"], u["system_seconds"] = float(us.group(1)), float(sy.group(1))
+            u["cpu_seconds"] = round(float(us.group(1)) + float(sy.group(1)), 1)
+            u["cpu_source"] = "rusage (waited-for children only)"
+    mr = m(r"Maximum resident set size")
+    if mr:
+        u["max_rss_kb"] = int(float(mr.group(1)))
+except Exception:
+    pass
+u["cpu_hours"] = round(u.get("cpu_seconds", 0) / 3600, 3)
+u["over_cpu_cap"] = u["cpu_hours"] > float(cpu_h)
+u["cpu_cap_hit"] = os.path.exists(os.path.join(wd, ".cpu.cap"))   # stopped at the whole-run CPU budget
+L.write_in_run(rd, "usage.json", json.dumps(u, indent=1) + "\n")
+print("limits-exec: cpu=%.1fs (%s) wall=%.1fs threads_cap=%s mem_cap=%sG enforced=%s over_cpu_cap=%s cpu_cap_hit=%s" % (
+    u.get("cpu_seconds", 0), u.get("cpu_source", "?"), u["wall_seconds"], threads, mem_g, u["enforced"], u["over_cpu_cap"],
+    u["cpu_cap_hit"]))
+EOF
+exit $RC

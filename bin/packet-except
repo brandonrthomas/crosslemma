@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+"""bin/packet-except FILE "ruling"   THE USER'S ACT (LESSONS.md "No packet carries blocked material").
+   bin/packet-except --list
+
+Adds FILE, by its sha256, to data/packet-exceptions.json: the user's file-by-file exceptions to the packet rule
+(bin/_packet.py). An excepted file may go into a worker's packet although it carries blocked material; it is neither
+blocked nor open material for any other packet. The hook refuses every orchestrator command or edit that names the
+list or this tool (a plain git add / commit / status / diff of the list excepted), so an exception is the user's,
+run with `!`, never the orchestrator's. Each addition is ledgered as the user's
+(PACKET-EXCEPT). FILE must be a file inside the tree; a later edit to it changes its sha256 and ends the exception.
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _approval as A
+
+LIST = os.path.join(A.ROOT, "data", "packet-exceptions.json")
+
+
+def load():
+    try:
+        with open(LIST) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--list"]:
+        for e in load():
+            print(f"{e.get('sha256', '?')[:16]}  {e.get('path', '?')}  {e.get('ruling', '')}")
+        return 0
+    if len(args) != 2 or not args[1].strip():
+        print(__doc__, file=sys.stderr)
+        return 2
+    path, ruling = args[0], " ".join(args[1].split())
+    p = os.path.realpath(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+    if not (p.startswith(os.path.realpath(A.ROOT) + os.sep) and os.path.isfile(p)):
+        print(f"refused: {path} is not a file inside the tree", file=sys.stderr)
+        return 3
+    sha, rel = A.sha256(p), os.path.relpath(p, A.ROOT)
+    entries = load()
+    if any(e.get("sha256") == sha for e in entries):
+        print(f"already excepted: {rel} ({sha[:16]})")
+        return 0
+    entries.append({"sha256": sha, "path": rel, "ruling": ruling, "added_utc": A.utc()})
+    os.makedirs(os.path.dirname(LIST), exist_ok=True)
+    with open(LIST + ".tmp", "w") as f:
+        json.dump(entries, f, indent=1)
+        f.write("\n")
+    try:   # the list changes only once its line is on the ledger (pending item P-4, user 2026-10-01)
+        A.ledger(A.ROOT, None, "PACKET-EXCEPT", f"{rel} sha256={sha} ruling={ruling}")
+    except OSError as e:
+        os.remove(LIST + ".tmp")
+        print(f"refused: the ledger line could not be written ({e}); the list is unchanged", file=sys.stderr)
+        return 1
+    os.replace(LIST + ".tmp", LIST)
+    print(f"excepted: {rel} ({sha[:16]}); {len(entries)} exception(s) on file")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

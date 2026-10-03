@@ -1,0 +1,119 @@
+#!/usr/bin/python3
+"""scripts/export-public DEST --name NAME --email EMAIL [--from REPO] [--ref REF] [--message TEXT]
+
+Makes the public copy of the kit at DEST: the tree at REF (default HEAD) of REPO (default this kit), without the kit's
+working record (HANDOFF.md, which becomes a short public note, and history/), as ONE new commit with no earlier history,
+authored and committed as NAME <EMAIL>. It never pushes: pushing is the user's act, after reading DEST.
+
+Refuses (exit 2, DEST untouched or removed) when:
+  - DEST exists, or lies inside REPO;
+  - NAME or EMAIL is missing, or either contains this machine's hostname, a private domain, a home path or a session
+    name (the patterns of scripts/docs/check_docs.py), or EMAIL is not of the form x@y.z;
+  - the exported tree fails any check of scripts/docs/check_docs.py (the changelog check is skipped: the export has no tags);
+  - after the commit, its author or committer is not exactly NAME <EMAIL>.
+Stdlib only.
+"""
+import argparse
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LEAVE_OUT = ("HANDOFF.md", "history")
+PUBLIC_HANDOFF = """# Handoff
+
+In the kit's own repository this file is the working pointer from one maintenance session to the next: what was done,
+what is open, and the preflight the next session runs first. That record is kept privately; this public copy starts
+without it. An instance of the kit has its own `HANDOFF.md`, made from [`templates/HANDOFF.md`](templates/HANDOFF.md).
+"""
+
+
+def fail(msg, dest=None, made=False):
+    if made and dest and os.path.isdir(dest):
+        shutil.rmtree(dest)
+    print(f"export-public: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def identity_problems(name, email, check_docs):
+    probs = []
+    host = socket.gethostname().split(".")[0].lower()
+    for label, v in (("name", name), ("email", email)):
+        if not v or not v.strip():
+            probs.append(f"{label} is empty")
+            continue
+        low = v.lower()
+        if host and re.search(rf"(^|[^a-z0-9]){re.escape(host)}([^a-z0-9]|$)", low):
+            probs.append(f"{label} {v!r} contains this machine's hostname {host!r}")
+        for pat, what in check_docs.SANITIZE:
+            if pat.search(v):
+                probs.append(f"{label} {v!r} contains {what}")
+    if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", email):
+        probs.append(f"email {email!r} is not an address")
+    return probs
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("dest")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--email", required=True)
+    ap.add_argument("--from", dest="src", default=HERE)
+    ap.add_argument("--ref", default="HEAD")
+    ap.add_argument("--message", default=None)
+    a = ap.parse_args()
+    src, dest = os.path.realpath(a.src), os.path.realpath(a.dest)
+    sys.path.insert(0, os.path.join(src, "scripts", "docs"))
+    try:
+        import check_docs
+    except ImportError:
+        fail(f"no scripts/docs/check_docs.py in {src}")
+    if os.path.exists(dest):
+        fail(f"{dest} exists; give a new directory")
+    if dest == src or dest.startswith(src + os.sep):
+        fail(f"{dest} is inside {src}")
+    probs = identity_problems(a.name, a.email, check_docs)
+    if probs:
+        fail("refused identity: " + "; ".join(probs))
+    ref = subprocess.run(["git", "-C", src, "rev-parse", "--verify", a.ref + "^{commit}"], capture_output=True, text=True)
+    if ref.returncode:
+        fail(f"no commit {a.ref} in {src}")
+    os.makedirs(dest)
+    arch = subprocess.Popen(["git", "-C", src, "archive", "--format=tar", a.ref], stdout=subprocess.PIPE)
+    untar = subprocess.run(["tar", "-x", "-C", dest], stdin=arch.stdout)
+    arch.wait()
+    if arch.returncode or untar.returncode:
+        fail("git archive | tar failed", dest, True)
+    for p in LEAVE_OUT:
+        q = os.path.join(dest, p)
+        shutil.rmtree(q) if os.path.isdir(q) else os.path.exists(q) and os.remove(q)
+    with open(os.path.join(dest, "HANDOFF.md"), "w") as f:
+        f.write(PUBLIC_HANDOFF)
+    probs = check_docs.check(dest, only=[c for c in check_docs.CHECKS if c != "changelog"])
+    if probs:
+        fail(f"the exported tree fails {len(probs)} documentation check(s), first: {probs[0]}", dest, True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_AUTHOR_NAME=a.name, GIT_AUTHOR_EMAIL=a.email, GIT_COMMITTER_NAME=a.name, GIT_COMMITTER_EMAIL=a.email)
+    short = ref.stdout.strip()[:12]
+    msg = a.message or f"crosslemma, public release (from {short})"
+    for cmd in (["git", "init", "-q", "-b", "main", dest],
+                ["git", "-C", dest, "-c", "user.useConfigOnly=true", "add", "-A"],
+                ["git", "-C", dest, "-c", "user.useConfigOnly=true", "-c", "commit.gpgsign=false", "commit", "-q", "-m", msg]):
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        if r.returncode:
+            fail(f"{' '.join(cmd[:4])} failed: {r.stderr.strip()}", dest, True)
+    who = subprocess.run(["git", "-C", dest, "log", "--format=%an <%ae>%n%cn <%ce>"], capture_output=True, text=True,
+                         env=env).stdout.split("\n")
+    want = f"{a.name} <{a.email}>"
+    if [w for w in who if w] != [want, want]:
+        fail(f"the commit's identity is {who!r}, not {want!r}", dest, True)
+    n = subprocess.run(["git", "-C", dest, "ls-files"], capture_output=True, text=True).stdout.count("\n")
+    print(f"export-public: {dest}: one commit, {n} files, author and committer {want}, from {a.ref} ({short}).")
+    print("export-public: nothing was pushed. Read the tree, then add a remote and push it yourself.")
+
+
+if __name__ == "__main__":
+    main()

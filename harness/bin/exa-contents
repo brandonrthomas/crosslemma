@@ -1,0 +1,4 @@
+#!/bin/bash
+# exa-contents URL  -> text of one page as Exa has it (JSON), through the gateway
+u=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1")
+exec curl -sS --max-time 150 "$GATEWAY/exa-contents?url=$u"

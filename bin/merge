@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""bin/merge RUN
+
+RULES.md step 4. Joins RUN/check.json with every well-formed referee.json (any run whose
+output/referee.json names RUN) into the verdict table: claim | tag | check | referee | earned.
+Writes RUN/verdict.md, prints it with the paths the operator reads directly. Referee notes are not
+printed here: the orchestrator does not summarize referee prose. Malformed referee output is
+listed as INVALID and ignored for the earned tag (a finding that is not typed does not exist).
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lib as L
+
+
+def main():
+    if len(sys.argv) != 2:
+        L.die(__doc__.strip())
+    rd = L.resolve_run(sys.argv[1])
+    name = os.path.basename(rd)
+    chk_path = os.path.join(rd, "check.json")
+    if not os.path.isfile(chk_path):
+        L.die(f"{name}: no check.json; run bin/check first")
+    chk = L.load_json(chk_path, "check.json")
+    doc = L.load_json(os.path.join(rd, "output", "claims.json"), "claims.json")
+    claims = {c.get("id"): c for c in doc.get("claims", []) if isinstance(c, dict)}
+    checks = {r["id"]: r for r in chk.get("claims", [])}
+    refs = L.referee_files()
+
+    rows, paths, families = [], [os.path.relpath(chk_path, L.ROOT)], []
+    for cid, c in claims.items():
+        cr = checks.get(cid, {"check": "unchecked", "reasons": ["not in check.json"]})
+        rlist = refs.get((name, cid), [])
+        cells, verdicts = [], []
+        live, stale = L.live_referees(rlist, cr, c)
+        for r in rlist:
+            paths.append(r.get("path", "?"))
+            if "error" in r:
+                cells.append(f"INVALID ({r['referee_run']})")
+            elif r in stale:
+                cells.append(f"STALE {r['verdict']} ({r['referee_run']}: artifact or claim changed since refereed)")
+            else:
+                cells.append(f"{r['verdict']}/{r.get('question', 'certify')} ({r['referee_run']}: {r['pointer']})")
+                verdicts.append(r["verdict"])
+        cross = L.cross_family_need(rd, doc, c, live)   # LESSONS.md "A cross-family certify read"
+        earned, why = L.earned_tag(c.get("tag"), cr["check"], verdicts, *L.sentence_need(doc, c, live), *cross[:2],
+                                   questions=L.proved_questions(live), mutations_missing=bool(cr.get("mutations_missing")))
+        rows.append((cid, c.get("tag"), cr["check"], " / ".join(cells) or "none", earned, why))
+        families.append(f"- {cid}: {cross[2]}")
+
+    md = chk.get("result_md", {})
+    lines = [f"# Verdict table — {name}", "", f"generated {L.now()} from check.json ({chk.get('generated')})", "",
+             "| claim | tag | check | referee | earned | why |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append("| " + " | ".join(str(x) for x in r) + " |")
+    lines += ["", "Model families (a PROVED claim needs a certify hold, a script claim its sentence hold, from the other family):"] + families
+    md_line = "missing" if not md.get("exists") else f"{md.get('lines')} lines, within_limit={md.get('within_limit')}, banned_untagged={len(md.get('banned_untagged', []))}"
+    lines += ["", f"claims schema: {doc.get('schema')}" + ("" if doc.get("schema") == L.V.SCHEMA else
+              "  (the old schema: no premises, no sentence referee; accepted where the run's brief names it)")]
+    lines += ["", f"result.md: {md_line}",
+              f"check overall: {chk.get('overall')}; prose flags: {chk.get('prose_flags', len(md.get('banned_untagged', [])))} (noted, not blocking)" + (f"; doc errors: {'; '.join(chk['doc_errors'])}" if chk.get("doc_errors") else ""),
+              "", "Read directly:"] + [f"- {p}" for p in paths]
+    noted = []
+    for cid, c in claims.items():
+        noted += [f"- {cid}: {ln}" for ln in L.notes_for(name, cid, c.get("supersedes"))]
+    if noted:
+        lines += ["", "CLAIMS.md notes (bin/annotate-claim) touching this run's claims:"] + noted
+    prem = [f"- {cid}: " + "; ".join(f"{x.get('kind')}: {x.get('what')}" + (f" (quote {x['quote']})" if x.get("quote") else "")
+                                      for x in c["premises"]) for cid, c in claims.items() if c.get("premises")]
+    if prem:   # what each claim rests on besides its artifact
+        lines += ["", "Premises (the claim's own list; `conditional` in the ledger header for published, source, ledger):"] + prem
+    stray = [k for k in refs if k[0] == name and k[1] not in claims]
+    if stray:
+        lines += ["", "referee.json files naming claim ids this run does not have: " + ", ".join(f"{k[1]}" for k in stray)]
+    # LESSONS.md "Formal statements captured beside the English": the formal statement beside the English, for the fidelity read.
+    sig_block = []
+    for cid, c in claims.items():
+        sigs = (checks.get(cid) or {}).get("signatures") or {}
+        if not sigs:
+            continue
+        sig_block += [f"### {cid} — claimed [{c.get('tag')}]", "", "English:", "", "> " + c.get("statement", "").strip(), "",
+                      "Formal (captured by `#check` in bin/check, from the artifact's declarations):", "", "```"]
+        for d in sorted(sigs):
+            sig_block += sigs[d].splitlines()
+        sig_block += ["```", ""]
+    if sig_block:
+        lines += ["", "## Formal statements", "",
+                  "Every hypothesis below must be carried by the English above it; a quantifier in the "
+                  "English wider than the formal one is an overclaim.", ""] + sig_block
+    text = "\n".join(lines) + "\n"
+    with open(os.path.join(rd, "verdict.md"), "w") as f:
+        f.write(text)
+    print(text, end="")
+    L.ledger(name, "MERGE", " ".join(f"{r[0]}={r[4]}" for r in rows))
+
+
+if __name__ == "__main__":
+    main()

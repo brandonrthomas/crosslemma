@@ -1,0 +1,429 @@
+#!/usr/bin/python3
+"""validate-claims [RUN_DIR]        (RUN_DIR defaults to $KIT_RUN, then the current directory)
+
+Form-only validator for output/claims.json and output/result.md: the subset of bin/check that needs
+no sandbox and no artifact execution. Standard library only, so bin/new-run can copy it into a run's
+input/ as validate-claims.py and the worker can run it inside the sandbox before finishing:
+
+    python3 input/validate-claims.py
+
+Checks (ERR = must fix; WARN = look, may be fine):
+  document   schema string, run name = run directory name, claims is a list, ids unique
+  premises   (schema kit/claims/2; LESSONS.md "Premises on every claim; the primary text quoted; a conditional marker") PROVED and VERIFIED claims carry a non-empty
+             `premises` list of {kind, what[, source, quote]}; kind in PREMISE_KINDS; a `published` or `source`
+             premise names the primary text held in the run (`source`) and a file quoting, verbatim and with its
+             location, the statement used (`quote`), both listed in artifact.deps; a `ledger` premise is one C-NNN.
+             Schema kit/claims/1 (runs made before kit-v0.3, and byte-copy restatements of them) is still accepted,
+             `premises` optional there.
+  claim      no unknown or misplaced field (a top-level deps is an error: it belongs under artifact);
+             id c<1-3 digits>; tag in the six; statement non-empty, <= 600 chars, no newline
+             (WARN if it looks like more than one sentence); artifact.type allowed for the tag;
+             artifact.path relative, under output/, not result.md, EXISTS and is non-empty; script
+             needs cmd; lean needs decls; deps exist under output/; required fields per tag
+             (VERIFIED: range, coverage, silent_links; NUMERIC: range; PROVED: silent_links;
+             CONJECTURE: evidence, counter_pressure; HEURISTIC: nonrigorous_step; GAP: must_show);
+             supersedes null or C-NNN; optional artifact.mutations well-formed (list of
+             {name, cmd[, expect_exit][, expect_stdout_contains]}); WARN for a VERIFIED script claim with no
+             mutations (it earns NUMERIC), and for a mutation that names no FAIL line (expect_stdout_contains),
+             which under kit/claims/2 is an ERR
+  result.md  exists, <= 150 lines; WARN per line with a banned word and no tag
+Exit 0 when there is no ERR. bin/check imports the validate_* functions from this file, so the
+worker-side and checker-side rules are one piece of code (LESSONS.md "`bin/validate-claims` is one piece of code", 2026-09-16).
+"""
+import json
+import os
+import re
+import sys
+
+SCHEMA = "kit/claims/2"   # what new briefs write; in step with bin/_lib.py SCHEMA_PREFIX
+SCHEMAS_ACCEPTED = ("kit/claims/1", "kit/claims/2")
+PREMISE_KINDS = ("kernel", "classical", "published", "source", "ledger", "software")
+CONDITIONAL_KINDS = ("published", "source", "ledger")   # the entry header says "(conditional: ...)"
+PREMISES_REQUIRED = ("PROVED", "VERIFIED")
+TAGS = ("PROVED", "VERIFIED", "NUMERIC", "CONJECTURE", "HEURISTIC", "GAP")
+ARTIFACT_TYPES = ("script", "lean", "text", "none")
+BANNED = ("proves", "shows", "establishes", "therefore", "it follows", "clearly", "obviously", "wlog")
+TAG_RE = re.compile(r"\[(PROVED|VERIFIED|NUMERIC|CONJECTURE|HEURISTIC|GAP)\b[^\]]*\]")  # qualifier allowed: [PROVED, sketch]
+LOCAL_ID_RE = re.compile(r"^c[0-9]{1,3}$")
+RESULT_MD_MAX_LINES = 150
+STATEMENT_MAX_CHARS = 600
+
+# artifact requirements per tag: (allowed artifact types, required claim fields)
+TAG_RULES = {
+    "PROVED":     (("lean", "text"),           ("silent_links",)),
+    "VERIFIED":   (("script",),                ("range", "coverage", "silent_links")),
+    "NUMERIC":    (("script",),                ("range",)),
+    "CONJECTURE": (("script", "text", "none"), ("evidence", "counter_pressure")),
+    "HEURISTIC":  (("script", "text", "none"), ("nonrigorous_step",)),
+    "GAP":        (("text", "none"),           ("must_show",)),
+}
+
+
+def _rel_output_path(p):
+    return isinstance(p, str) and p and not os.path.isabs(p) and ".." not in p.split("/") \
+        and p.startswith("output/") and os.path.basename(p) != "result.md"
+
+
+def claims1_allowed(rd):
+    """kit/claims/1 (no premises, no sentence referee) is accepted for a run only if its BRIEF.md names it AND, if the run
+    was ever launched, BRIEF.md still has the bytes the user approved: a worker can edit its own brief, so the brief
+    alone proves nothing (LESSONS.md "Premises on every claim; the primary text quoted; a conditional marker"; the outside
+    review's F3). Every run made before kit/claims/2 embeds that schema in its brief, and a byte-copy restatement of an old
+    run's claims (never launched) says so. Inside a worker's sandbox the approvals are invisible, so there the answer is
+    advisory; the host's bin/check, bin/merge and bin/ledger-claims decide."""
+    import glob
+    import hashlib
+    bp = os.path.join(rd, "BRIEF.md")
+    try:
+        data = open(bp, "rb").read()
+    except OSError:
+        return False
+    if b"kit/claims/1" not in data:
+        return False
+    rd = os.path.realpath(rd)
+    root, name = os.path.dirname(os.path.dirname(os.path.dirname(rd))), os.path.basename(rd)
+    records = glob.glob(os.path.join(root, ".claude", "state", "approvals", "used", f"launch-{name}.*.json"))
+    if not records:
+        return True    # never launched: no worker has had the brief in its hands
+    rel = os.path.relpath(bp, root)
+    approved = set()
+    for r in records:
+        try:
+            approved.add(json.load(open(r)).get("manifest", {}).get(rel))
+        except (OSError, ValueError):
+            continue
+    return hashlib.sha256(data).hexdigest() in approved
+
+
+def validate_claims_doc(doc, run_name, rd=None):
+    """Structural validation of claims.json. Returns (list of claims, list of doc-level errors). With `rd`, a
+    kit/claims/1 document is accepted only where claims1_allowed(rd)."""
+    errs = []
+    if not isinstance(doc, dict):
+        return [], ["claims.json top level is not an object"]
+    if doc.get("schema") not in SCHEMAS_ACCEPTED:
+        errs.append(f"schema field is {doc.get('schema')!r}, expected {SCHEMA!r}")
+    elif doc.get("schema") != SCHEMA and rd is not None and not claims1_allowed(rd):
+        errs.append(f"schema field is {doc.get('schema')!r}: this run's brief asks for {SCHEMA!r} (kit/claims/1 only "
+                    "where the run's BRIEF.md names it)")
+    if doc.get("run") != run_name:
+        errs.append(f"run field is {doc.get('run')!r}, expected {run_name!r}")
+    claims = doc.get("claims")
+    if not isinstance(claims, list):
+        return [], errs + ["claims field is not a list"]
+    ids = [c.get("id") if isinstance(c, dict) else None for c in claims]
+    for i in set(ids):
+        if ids.count(i) > 1:
+            errs.append(f"duplicate claim id {i!r}")
+    return claims, errs
+
+
+def validate_mutations(art):
+    """Shape of the optional artifact.mutations list (bin/check --mutate runs them). Returns errors."""
+    e = []
+    muts = art.get("mutations")
+    if muts is None:
+        return e
+    if not isinstance(muts, list) or not muts:
+        return ["artifact.mutations must be a non-empty list of {name, cmd[, expect_exit]} objects"]
+    names = set()
+    for i, m in enumerate(muts):
+        if not isinstance(m, dict):
+            e.append(f"artifact.mutations[{i}] is not an object"); continue
+        n, cmd = m.get("name"), m.get("cmd")
+        if not isinstance(n, str) or not n.strip():
+            e.append(f"artifact.mutations[{i}].name missing")
+        elif n in names:
+            e.append(f"artifact.mutations duplicate name {n!r}")
+        names.add(n)
+        if not isinstance(cmd, str) or not cmd.strip():
+            e.append(f"artifact.mutations[{i}].cmd missing")
+        ee = m.get("expect_exit", "nonzero")
+        if not (ee == "nonzero" or (isinstance(ee, int) and not isinstance(ee, bool) and ee != 0)):
+            e.append(f"artifact.mutations[{i}].expect_exit must be omitted, 'nonzero' or a non-zero integer")
+        fl = m.get("expect_stdout_contains")
+        if fl is not None and (not isinstance(fl, str) or not fl.strip()):
+            e.append(f"artifact.mutations[{i}].expect_stdout_contains must be a non-empty string (the targeted part's FAIL line)")
+        extra = set(m) - {"name", "cmd", "expect_exit", "expect_stdout_contains"}
+        if extra:
+            e.append(f"artifact.mutations[{i}] has unknown fields {sorted(extra)}")
+    return e
+
+
+# LESSONS.md "Unknown or misplaced fields are errors" (2026-09-22, after run 086): a field in the wrong place is an error, not a silent no-op.
+# Run 086 put `deps` at the claim's top level; this validator passed it, bin/check hashed nothing and a referee
+# run would have received no deps. Every field a claim or its artifact may carry is listed here (SCHEMAS.md §1).
+CLAIM_FIELDS = {"id", "tag", "statement", "artifact", "range", "coverage", "silent_links", "evidence",
+                "counter_pressure", "nonrigorous_step", "must_show", "supersedes", "premises"}
+ARTIFACT_FIELDS = {"type", "path", "cmd", "expect_exit", "expect_stdout_contains", "expect_stdout_sha256",
+                   "decls", "deps", "mutations", "native_decide"}
+
+
+def misplaced_fields(c):
+    """Unknown or misplaced fields of one claim. Returns errors."""
+    e = []
+    for k in sorted(set(c) - CLAIM_FIELDS):
+        if k in ARTIFACT_FIELDS:
+            e.append(f"field {k!r} belongs under artifact (artifact.{k}); at the claim's top level it is ignored")
+        else:
+            e.append(f"unknown claim field {k!r} (SCHEMAS.md §1 lists the fields)")
+    art = c.get("artifact")
+    if isinstance(art, dict):
+        for k in sorted(set(art) - ARTIFACT_FIELDS):
+            if k in CLAIM_FIELDS:
+                e.append(f"field artifact.{k} belongs at the claim's top level ({k})")
+            else:
+                e.append(f"unknown artifact field {k!r} (SCHEMAS.md §1 lists the fields)")
+    return e
+
+
+def validate_premises(c, schema):
+    """The `premises` list. Required for PROVED and VERIFIED under kit/claims/2. Returns errors."""
+    e = []
+    prem = c.get("premises")
+    if prem is None:
+        if schema == SCHEMA and c.get("tag") in PREMISES_REQUIRED:
+            e.append(f"premises missing (required for tag {c.get('tag')} under {SCHEMA}; "
+                     '[{"kind": "kernel", "what": "Lean 4.32 + Mathlib"}] for a Lean claim that rests on nothing else)')
+        return e
+    if not isinstance(prem, list) or not prem:
+        return ["premises must be a non-empty list of {kind, what[, source, quote]} objects"]
+    deps = set(((c.get("artifact") or {}).get("deps")) or [])
+    for i, p in enumerate(prem):
+        if not isinstance(p, dict):
+            e.append(f"premises[{i}] is not an object"); continue
+        extra = set(p) - {"kind", "what", "source", "quote"}
+        if extra:
+            e.append(f"premises[{i}] has unknown fields {sorted(extra)}")
+        k, w = p.get("kind"), p.get("what")
+        if k not in PREMISE_KINDS:
+            e.append(f"premises[{i}].kind {k!r} not in {PREMISE_KINDS}")
+        if not isinstance(w, str) or not w.strip():
+            e.append(f"premises[{i}].what missing")
+        if k == "ledger" and isinstance(w, str) and not re.match(r"^C-[0-9]{3,}$", w.strip()):
+            e.append(f"premises[{i}]: a ledger premise names one entry, C-NNN (got {w!r})")
+        for f in ("source", "quote"):
+            v = p.get(f)
+            if v is None:
+                if k in ("published", "source"):
+                    e.append(f"premises[{i}]: a {k} premise needs `{f}` ({'the primary text, held in the run' if f == 'source' else 'the statement used, quoted verbatim with its location'})")
+                continue
+            if not _rel_output_path(v):
+                e.append(f"premises[{i}].{f} {v!r} must be relative, under output/")
+            elif v not in deps:
+                e.append(f"premises[{i}].{f} {v} must also be listed in artifact.deps (a referee gets only deps)")
+    return e
+
+
+def validate_claim(c, schema=None):
+    """Field-level validation of one claim (no filesystem access). Returns list of error strings. `schema` is the
+    document's schema string; the kit/claims/2 rules apply only when it is that."""
+    e = []
+    if not isinstance(c, dict):
+        return ["claim is not an object"]
+    e += misplaced_fields(c)
+    cid = c.get("id")
+    if not isinstance(cid, str) or not LOCAL_ID_RE.match(cid):
+        e.append(f"id {cid!r} must match c<1-3 digits>")
+    tag = c.get("tag")
+    if tag not in TAGS:
+        e.append(f"tag {tag!r} not in {TAGS}")
+    st = c.get("statement")
+    if not isinstance(st, str) or not st.strip():
+        e.append("statement missing")
+    else:
+        if len(st) > STATEMENT_MAX_CHARS:
+            e.append(f"statement is {len(st)} chars; limit {STATEMENT_MAX_CHARS}")
+        if "\n" in st:
+            e.append("statement contains a newline (one sentence, one line)")
+    art = c.get("artifact")
+    if not isinstance(art, dict):
+        e.append("artifact object missing")
+        atype = None
+    else:
+        atype = art.get("type")
+        if atype not in ARTIFACT_TYPES:
+            e.append(f"artifact.type {atype!r} not in {ARTIFACT_TYPES}")
+        if atype != "none":
+            p = art.get("path")
+            if not isinstance(p, str) or not p:
+                e.append("artifact.path missing")
+            elif not _rel_output_path(p):
+                e.append(f"artifact.path {p!r} must be relative, under output/, not result.md")
+        deps = art.get("deps")
+        if deps is not None and atype == "none":
+            e.append("artifact.deps makes no sense on a 'none' artifact")
+        elif deps is not None:
+            if not isinstance(deps, list) or not all(isinstance(d, str) for d in deps):
+                e.append("artifact.deps must be a list of relative paths under output/")
+            else:
+                for d in deps:
+                    if not _rel_output_path(d):
+                        e.append(f"artifact.deps entry {d!r} must be relative, under output/, not result.md")
+        if atype == "script" and not isinstance(art.get("cmd"), str):
+            e.append("artifact.cmd missing for script artifact")
+        if atype == "lean":
+            decls = art.get("decls")
+            if not isinstance(decls, list) or not decls or not all(isinstance(d, str) and d for d in decls):
+                e.append("artifact.decls must be a non-empty list of declaration names")
+        if atype != "script" and art.get("mutations") is not None:
+            e.append("artifact.mutations is only for script artifacts")
+        e += validate_mutations(art)
+        # P-3 B5 (user 2026-10-01): RULES.md §8, a mutation kills only with its targeted part's FAIL line, named in
+        # expect_stdout_contains. An error under kit/claims/2; a warning (claim_warnings) for older documents.
+        if schema == SCHEMA and atype == "script" and isinstance(art.get("mutations"), list):
+            for m in art["mutations"]:
+                if isinstance(m, dict) and not m.get("expect_stdout_contains"):
+                    e.append(f"mutation {m.get('name')!r} names no FAIL line (expect_stdout_contains): under {SCHEMA} a "
+                             "mutation kills only with its targeted part's FAIL line")
+    if tag in TAG_RULES:
+        allowed, required = TAG_RULES[tag]
+        if atype is not None and atype not in allowed:
+            e.append(f"tag {tag} needs an artifact of type {allowed}, got {atype!r}")
+        for fld in required:
+            v = c.get(fld)
+            if fld == "silent_links":
+                if not isinstance(v, list) or not v or not all(isinstance(x, str) and x.strip() for x in v):
+                    e.append("silent_links must be a non-empty list of strings (['none'] if there are none)")
+            elif not isinstance(v, str) or not v.strip():
+                e.append(f"{fld} missing (required for tag {tag})")
+    sup = c.get("supersedes")
+    if sup is not None and not (isinstance(sup, str) and re.match(r"^C-[0-9]{3,}$", sup)):
+        e.append(f"supersedes {sup!r} must be null or a global id C-NNN")
+    e += validate_premises(c, schema)
+    return e
+
+
+def claim_warnings(c):
+    """Advisory only: things a careful author would look at again."""
+    w = []
+    st = c.get("statement") if isinstance(c, dict) else None
+    if isinstance(st, str):
+        # more than one sentence? terminator followed by a space and a capital letter, ignoring e.g./i.e./cf.
+        body = re.sub(r"\b(e\.g|i\.e|cf|vs|resp|approx|no|eq|fig|thm|lem|sec|ch|p|pp)\.", "", st, flags=re.I)
+        if re.search(r"[.!?]\s+[A-Z]", body):
+            w.append("statement may be more than one sentence")
+    art = c.get("artifact") if isinstance(c, dict) else None
+    # LESSONS.md "A mutation kills only with its FAIL line": without it a crash, or another part's failure, counts as a kill
+    if isinstance(art, dict) and art.get("type") == "script" and isinstance(art.get("mutations"), list):
+        for m in art["mutations"]:
+            if isinstance(m, dict) and not m.get("expect_stdout_contains"):
+                w.append(f"mutation {m.get('name')!r} names no FAIL line (expect_stdout_contains): a crash, or a failure of "
+                         "another part, would count as killing it")
+    if isinstance(art, dict) and c.get("tag") == "VERIFIED" and art.get("type") == "script" and not art.get("mutations"):
+        w.append("VERIFIED script claim with no artifact.mutations: a range/coverage claim without a mutation test "
+                 "that makes the checker fail is NUMERIC, not VERIFIED (bin/check --mutate)")
+    return w
+
+
+def file_checks(rd, c):
+    """Existence checks for a well-formed claim's artifact and deps under rd/output/. Returns errors."""
+    e = []
+    art = c.get("artifact", {})
+    if art.get("type") == "none":
+        return e
+    for what, p in [("artifact.path", art.get("path"))] + [("artifact.deps", d) for d in (art.get("deps") or [])]:
+        if not _rel_output_path(p):
+            continue  # already an error in validate_claim
+        full = os.path.join(rd, p)
+        if not os.path.isfile(full):
+            e.append(f"{what} {p} does not exist")
+        elif os.path.getsize(full) == 0:
+            e.append(f"{what} {p} is empty")
+    return e
+
+
+PACKAGE_RE = re.compile(r"\bcypari2\b|\bfrom sage\b|\bimport sage\b|[\"' ](gp|mwrank|Singular|M2|msolve|sage)[\"' ]")
+
+
+def package_warnings(rd, c):
+    """Advisory (RULES.md §2, computer algebra): a VERIFIED script that appears to call a computer-algebra package needs a
+    certificate re-checked without it, or two independent packages agreeing; otherwise it is NUMERIC."""
+    art = c.get("artifact") or {}
+    if c.get("tag") != "VERIFIED" or art.get("type") != "script":
+        return []
+    hits = set()
+    for p in [art.get("path")] + list(art.get("deps") or []):
+        if isinstance(p, str) and p.endswith((".py", ".sh", ".gp", ".sage", ".m2", ".sing")):
+            try:
+                hits |= {m.group(1) or m.group(0).strip() for m in PACKAGE_RE.finditer(open(os.path.join(rd, p), errors="replace").read())}
+            except OSError:
+                pass
+    return [f"the script appears to use {', '.join(sorted(hits))}: VERIFIED needs a certificate re-checked by code that "
+            "does not use the package, or two independent packages agreeing; otherwise NUMERIC "
+            "(RULES.md §2, Computer algebra)"] if hits else []
+
+
+def banned_scan(path):
+    """Lines of a markdown file that carry a banned word and no tag. None if the file is missing."""
+    hits = []
+    try:
+        with open(path, errors="replace") as f:
+            for n, line in enumerate(f, 1):
+                low = line.lower()
+                for w in BANNED:
+                    if re.search(r"\b" + re.escape(w) + r"\b", low) and not TAG_RE.search(line):
+                        hits.append({"line": n, "word": w})
+                        break
+    except FileNotFoundError:
+        return None
+    return hits
+
+
+def main():
+    rd = sys.argv[1] if len(sys.argv) > 1 else (os.environ.get("KIT_RUN") or os.getcwd())
+    rd = os.path.realpath(rd)
+    run_name = os.path.basename(rd)
+    n_err = n_warn = 0
+
+    def err(msg):
+        nonlocal n_err; n_err += 1; print("ERR  " + msg)
+
+    def warn(msg):
+        nonlocal n_warn; n_warn += 1; print("WARN " + msg)
+
+    cj = os.path.join(rd, "output", "claims.json")
+    try:
+        with open(cj) as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        err(f"output/claims.json missing (run dir {rd})"); doc = None
+    except json.JSONDecodeError as ex:
+        err(f"output/claims.json is not valid JSON: {ex}"); doc = None
+    if doc is not None:
+        claims, derrs = validate_claims_doc(doc, run_name, rd)
+        for d in derrs:
+            err("claims.json: " + d)
+        for i, c in enumerate(claims):
+            cid = c.get("id") if isinstance(c, dict) else f"#{i}"
+            errs = validate_claim(c, doc.get("schema"))
+            if isinstance(c, dict) and isinstance(c.get("artifact"), dict):
+                errs += file_checks(rd, c)
+            for x in errs:
+                err(f"{cid}: {x}")
+            if not errs:
+                print(f"OK   {cid} [{c.get('tag')}] artifact={c['artifact'].get('type')}")
+            for x in (claim_warnings(c) + package_warnings(rd, c)) if isinstance(c, dict) else []:
+                warn(f"{cid}: {x}")
+        if not claims and not derrs:
+            warn("claims.json has no claims")
+
+    rmd = os.path.join(rd, "output", "result.md")
+    hits = banned_scan(rmd)
+    if hits is None:
+        err("output/result.md missing")
+    else:
+        n = sum(1 for _ in open(rmd, errors="replace"))
+        if n > RESULT_MD_MAX_LINES:
+            err(f"output/result.md has {n} lines; limit {RESULT_MD_MAX_LINES}")
+        else:
+            print(f"OK   result.md {n} lines")
+        for h in hits:
+            warn(f"result.md line {h['line']}: '{h['word']}' on a line with no tag (noted on the record, not blocking)")
+
+    print(f"validate-claims: {n_err} error(s), {n_warn} warning(s) -> {'CLEAN' if n_err == 0 else 'FIX AND RERUN'}")
+    sys.exit(0 if n_err == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()

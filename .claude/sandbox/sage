@@ -1,0 +1,10 @@
+#!/bin/sh
+# SageMath for a sandboxed worker (LESSONS.md "Computer algebra is an optional module, and its results need a
+# certificate"). The instance's conda environment is mounted read-only at its own path, named by $KIT_SAGE, which the
+# sandbox sets only when the module is linked. Its bin/ goes on PATH for Sage's own process tree only, so
+# /usr/bin/python3 stays the sandbox's python3; Sage's writable state goes to the sandbox's /tmp.
+SAGE_ENV="${KIT_SAGE:?no computer-algebra module is linked in this workspace}"
+PATH="$SAGE_ENV/bin:$PATH"; CONDA_PREFIX="$SAGE_ENV"
+DOT_SAGE="${DOT_SAGE:-/tmp/dot_sage}"; MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
+export PATH CONDA_PREFIX DOT_SAGE MPLCONFIGDIR
+exec "$SAGE_ENV/bin/sage" "$@"

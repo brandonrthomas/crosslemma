@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+"""bin/approve — THE USER'S ACT. The hook keeps the orchestrator away from it.
+
+  bin/approve RUN [RUN …] [--digest HEX] -- <launch flags>   a launch (flags required, --model included); several runs = batch consent;
+                                                             flags after -- bind bin/run-external's flags
+  bin/approve --ledger RUN c1 [c2 …]                         a bin/ledger-claims append of exactly these ids
+  bin/approve --annotate C-NNN "text"                        a bin/annotate-claim note with exactly this text
+  bin/approve --annotate-batch FILE                          several notes (a JSON list of {"id", "text"} in FILE),
+                                                             one approval, printed in full; `bin/annotate-claim --batch FILE`
+  bin/approve --session -- <astra-session arguments>         a headless bin/astra-session
+  --show also prints every file's contents; --digest refuses unless the bytes are the ones bin/manifest showed.
+
+Prints path, size and sha256 of everything the approval is bound to, writes a single-use record that
+expires in 30 minutes, and ledgers an APPROVE line. Any later edit to those bytes voids it.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _approval
+
+if __name__ == "__main__":
+    sys.exit(_approval.approve_main(sys.argv[1:], do_write=True))

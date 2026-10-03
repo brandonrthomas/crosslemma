@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Append one line to the global append-only ledger. Usage: ledger [-r RUN] EVENT detail...
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+LEDGER="$ROOT/LEDGER.log"
+# never create the ledger: a tree without one is not an instance (LESSONS.md "A session works on the tree it was opened in")
+[ -f "$LEDGER" ] || { echo "ledger: no LEDGER.log at $ROOT: this tree is not an instance (the kit, or a command run in the wrong directory); nothing appended" >&2; exit 2; }
+RUN="-"
+if [ "$1" = "-r" ]; then RUN="$2"; shift 2; fi
+EV="${1:-NOTE}"; shift || true
+# P-12 (a low finding of the code audit): every whitespace run, line breaks of every kind included, becomes one space, so no
+# field writes a line of its own (as bin/_lib.py's ledger does)
+one() { /usr/bin/python3 -c 'import sys; print(" ".join(sys.argv[1].split()))' "$1"; }
+printf '%s | orchestrator | %s | %s | %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(one "$RUN")" "$(one "$EV")" "$(one "$*")" >> "$LEDGER"

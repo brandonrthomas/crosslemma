@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# Launch one worker as a headless MAIN process (not a subagent) on one of three routes: --via openrouter (the default),
+# --via anthropic (the user's Claude Code login; `claude -p`) or --via codex (the user's Codex login). A new
+# instance enables anthropic and codex (bin/new-workspace), so name --via on every launch.
+# LESSONS.md "Every worker is a headless main process" (user, 2026-09-16 09:44 MST): workers launch this way so no harness subagent
+# note reaches them, and model / effort / tools / turn cap are set per worker on the command line.
+#
+#   bin/run-external RUN --model ID [--via openrouter|anthropic|codex] [--effort low|medium|high|xhigh|max]
+#                        [--max-turns N] [--prompt "text"] [--retries N]
+#                        [--network] [--module NAME ...] [--wall-hours H] [--dry-run] [--detach]
+#   Refuses (exit 3) without a valid user approval of the run's bytes: bin/approve (LESSONS.md "Every launch and every ledger append consumes a byte-bound").
+#   LESSONS.md "Networked and Codex launches need their flags bound" (2026-09-22):
+#   --via codex   the user's Codex login (ChatGPT plan); ID e.g. gpt-5.6-sol, gpt-6-astra. The whole codex
+#                 process runs inside bwrap (bin/_ext.py codex). Codex has no turn cap of its own: --max-turns caps
+#                 its tool calls, counted from the transcript as it arrives (LESSONS.md "A Codex worker's tool calls
+#                 are capped"); --retries does not apply. Before the approval, Codex renders the launch's prompt
+#                 offline and the launch is refused if it offers sub-agents (bin/_ext.py codex-probe).
+#   --wall-hours  wall-clock cap of the whole launch, every route (LESSONS.md 'A wall-clock cap on every route'): default 4 on the
+#                 Claude routes, 2 on Codex. A Claude worker runs under `timeout` with one deadline across its
+#                 rate-limit retries; at the cap it is stopped (TERM, KILL 60 s later) and EXIT-EXT says
+#                 wall_cap_hit=1. No more hand-set systemd stop timers.
+#   --network     the worker gets the web: Claude routes get WebSearch, WebFetch and a Bash sandbox sharing the
+#                 network; Codex gets live web search and a shared network. Brave/Exa go through a key-holding
+#                 gateway outside the sandbox. Without --network a Codex worker reaches only the model provider,
+#                 through an allowlisting egress proxy.
+#   --module NAME a licence module of the instance's kit-env.json (bin/_env.py): mounted for this worker, which on a run
+#                 without the network reaches that module's licence servers and nothing else, through a relay here;
+#                 every connection is logged (RUN/licence.log). Bound in the approval; checked before it is touched.
+#   --network and --via codex need RUN/HARNESS-NOTE.md for their route (bin/new-run --harness claude-net|codex|codex-net) and an
+#   approval that binds the flags (`-- <flags>`). Each leaves RUN/RECORD-EXT.md: hashes of the transcript, the
+#   gateway and egress logs and every file under RUN/downloads/, and the disclosure. --dry-run prints what
+#   would run and touches no approval.
+#   --detach      (user 2026-09-22 14:32) runs the launch as a systemd user service, kit-run-RUN, and
+#                 returns once it has started; the run survives the calling shell and session. The approval is
+#                 consumed inside the service as usual; --detach, like --dry-run, is never part of it. Output:
+#                 .claude/state/ext/RUN/detached.out; exit status: detached.exit; watch: bin/watch-run RUN -f;
+#                 stop: systemctl --user stop kit-run-RUN.
+#   bin/run-external --queue RUN1 RUN2 … [flags] [--detach]   (LESSONS.md 'A queue for runs approved together')
+#                 runs approved together (bin/approve RUN1 RUN2 … -- flags), one at a time. Each run
+#                 first passes this launcher's own checks (a dry run each); then every approval is used at once
+#                 (bin/_approval.py queue: all checked, then all consumed, into a queue record the orchestrator cannot
+#                 write), so no approval can expire while an earlier run works. Each run is released just before its
+#                 launch (--queued NONCE, internal) only with the same flags and only if its bytes equal what was
+#                 approved; a run whose bytes changed is refused and the queue goes on. QUEUE-START / QUEUE-RUN ledger
+#                 lines. With --detach the whole queue runs as the user service kit-queue-<id>. The queue lives for
+#                 the sum of its runs' wall caps plus 30 minutes. It stops after a run that ended on the plan's usage
+#                 limit or the provider's capacity refusal (QUEUE-STOP); the runs not released need new approvals
+#                 (LESSONS.md "A queue stops at the plan's usage limit").
+#   RUN    run name (e.g. 025-ext-canary) or path under workspace-*/runs/; BRIEF.md must exist.
+#   ID     via openrouter (the default): an OpenRouter model id, e.g. openai/gpt-6-astra or
+#          ~anthropic/claude-fable-latest; the key is read from $OPENROUTER_KEYFILE (default ~/.config/openrouter/key).
+#          via anthropic: the user's own Claude Code login (subscription), model alias or id such as
+#          fable, opus, sonnet, claude-fable-5-1. No OpenRouter key is read on this route.
+#          via codex: a Codex model id, e.g. gpt-5.6-sol, gpt-6-astra.
+#   --effort  checked here per route (Claude: low medium high xhigh max; Codex adds minimal), default high.
+#   --max-turns  default 300. A brief that allows more tool calls ("at most N tool calls") is refused here, before
+#                the approval is touched; bin/lint-brief warns of it first.
+#
+# Limits (LESSONS.md "Limits are enforced, not promised"): the worker runs through bin/limits-exec, i.e. inside a systemd user scope
+# with CPUQuota = RD/.limits threads x 100 % and MemoryMax = mem_gb; the scope's cgroup CPU time of
+# the whole tree goes to RD/usage.json and the EXIT-EXT ledger line. Inside bwrap every command gets
+# ulimit -t (cpu_hours) and OMP/OPENBLAS/MKL/NUMEXPR_NUM_THREADS = threads from the hook. The whole run's CPU budget
+# (RD/.limits cpu_hours) is enforced too: limits-exec stops the tree when it is spent, exit 152, cpu_cap_hit=1 on
+# EXIT-EXT (LESSONS.md "The whole-run CPU budget is enforced"). Without a systemd user manager nothing can be enforced,
+# so the launch is refused before the approval is touched (limits-exec --probe; P-3 B3).
+# The record: EXIT-EXT carries exit, wall time, attempts, the approved model, route and effort, effort_seen= (what
+# the requests carried), models_seen= and model_fallback= (the models that answered, from the transcript; LESSONS.md
+# "The model a worker ran on is recorded"), wall_cap_hit=, turn_cap_hit= (Codex: exit 125), plan_limit=,
+# at_capacity= and the usage figures. Every CLAUDE* and ANTHROPIC_* variable the parent session set or inherited
+# is dropped before launch (LESSONS.md "A parent session's routing never reaches a worker").
+# Sandbox: the worker process carries KIT_WORKER_RUN=<run dir>; .claude/hooks/sandbox.py applies
+# the kit-worker rules to any main process with that variable (binds it to the run dir, bwraps
+# Bash, denies everything else, ledgers every call). --setting-sources project,local keeps the
+# project hooks and drops user-scope hooks/settings; no-mcp.json drops user MCP servers.
+# No spending cap on any run (LESSONS.md 'No spending cap on any run', user 2026-09-25): --max-budget-usd is never
+# passed and --budget is refused; --max-turns is the turn cap. Logs: RUN/launch.log (stream-json; Codex: RUN/launch.jsonl), RUN/launch.err.
+# While the worker runs they are written to .claude/state/ext/RUN/logs/, which no worker can reach, and moved
+# into RUN at exit (user 2026-09-22 14:32: a worker must not be able to alter its own transcript).
+# RUN_EXTERNAL_DEBUG=1 adds Claude Code's API debug log (debug.log, same place).
+#
+# Upstream rate limits (found in the source, 2026-09-16): OpenRouter answers a rate-limited Astra
+# request with an error object under HTTP 200, which Claude Code reports as "empty or malformed
+# response (HTTP 200)" and does not retry. When a run exits non-zero with that signature in the CLI's own words
+# (its stderr or its events, never a tool result or the model's text: P-12 H4), this
+# script waits (30 s, 60 s, 120 s, ...) and resumes the same session with `--resume` (or relaunches
+# fresh if the worker had not yet made a tool call), up to --retries times (default 3), ledgering
+# each RETRY-EXT.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+KEYFILE="${OPENROUTER_KEYFILE:-$HOME/.config/openrouter/key}"
+
+usage() { sed -n '2,/^set -euo/p' "$0" | grep '^#' >&2; exit "${1:-2}"; }
+[ $# -ge 1 ] || usage
+case "$1" in -h|--help) usage 0;; esac   # answered before anything on the launch path
+
+# The queue. --queue-run is its internal loop (what --detach runs as a service).
+if [ "$1" = --queue-run ]; then
+  NONCE="$2"; shift 2; QRUNS=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do QRUNS+=("$1"); shift; done
+  [ "${1:-}" = -- ] && shift
+  for i in "${!QRUNS[@]}"; do
+    r="${QRUNS[$i]}"
+    rc=0; "$0" "$r" "$@" --queued "$NONCE" || rc=$?   # a failed or refused run does not stop the queue, except as below
+    "$ROOT/bin/ledger" -r "$r" QUEUE-RUN "run-external: queue $NONCE: $r exit=$rc"
+    # LESSONS.md "A queue stops at the plan's usage limit": after a run that ended on the plan's usage limit or a capacity
+    # refusal, the next would end the same way and keep a launch record; the rest are not released (their approvals were
+    # used when the queue started; each can go on a new one).
+    if [ "$rc" != 0 ] && WHY=$(/usr/bin/python3 "$ROOT/bin/_ext.py" queue-stop "$r" 2>/dev/null); then
+      REST=("${QRUNS[@]:$((i+1))}")
+      "$ROOT/bin/ledger" -r "$r" QUEUE-STOP "run-external: queue $NONCE stopped after $r: $WHY; not released: ${REST[*]:-none}"
+      echo "run-external: queue $NONCE stopped after $r: $WHY; not released: ${REST[*]:-none} (each needs a new approval)" >&2
+      break
+    fi
+  done
+  exit 0
+fi
+if [ "$1" = --queue ]; then
+  shift; QRUNS=()
+  while [ $# -gt 0 ] && [[ "$1" != --* ]]; do QRUNS+=("$1"); shift; done
+  [ ${#QRUNS[@]} -ge 1 ] || { echo "run-external: --queue needs at least one run" >&2; exit 2; }
+  QFLAGS=(); QDETACH=0; REQ=(); PREV=""
+  for x in "$@"; do
+    case "$x" in --detach) QDETACH=1;; --dry-run|--queued) echo "run-external: $x is not a queue flag" >&2; exit 2;; *) QFLAGS+=("$x");; esac
+    { [ "$x" = --network ] || [ "$x" = --module ] || { [ "$PREV" = --via ] && [ "$x" = codex ]; }; } && REQ=(--require-flags)
+    PREV="$x"
+  done
+  for r in "${QRUNS[@]}"; do   # this launcher's own checks, run by run, before any approval is touched
+    "$0" "$r" "${QFLAGS[@]}" --check >/dev/null \
+      || { echo "run-external: queue refused: $r fails the launch checks (run bin/run-external $r ${QFLAGS[*]} --dry-run)" >&2; exit 2; }
+  done
+  # the queue lives for the sum of its runs' wall caps plus 30 minutes (bin/_approval.py derives it from the flags)
+  NONCE=$(env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_approval.py" queue "${QRUNS[@]}" "${REQ[@]}" -- "${QFLAGS[@]}") || exit 3
+  "$ROOT/bin/ledger" -r "${QRUNS[0]}" QUEUE-START "run-external: queue $NONCE: ${QRUNS[*]}; flags ${QFLAGS[*]}; every approval used now"
+  if [ "$QDETACH" = 1 ]; then
+    UNIT="kit-queue-$NONCE"; mkdir -p "$ROOT/.claude/state/ext"
+    systemd-run --user --unit="$UNIT" --collect --quiet --working-directory="$ROOT" \
+      --setenv=PATH="$PATH" --setenv=HOME="$HOME" ${OPENROUTER_KEYFILE:+--setenv=OPENROUTER_KEYFILE="$OPENROUTER_KEYFILE"} \
+      -p StandardOutput="append:$ROOT/.claude/state/ext/queue-$NONCE.out" -p StandardError="append:$ROOT/.claude/state/ext/queue-$NONCE.out" \
+      "$0" --queue-run "$NONCE" "${QRUNS[@]}" -- "${QFLAGS[@]}" \
+      || { echo "run-external: systemd-run failed; nothing launched. The approvals are used; the queue $NONCE expires with its wall caps plus 30 minutes. Tell the user." >&2; exit 1; }
+    echo "run-external: queue $NONCE (${QRUNS[*]}) detached as user service $UNIT; output .claude/state/ext/queue-$NONCE.out"
+    exit 0
+  fi
+  exec "$0" --queue-run "$NONCE" "${QRUNS[@]}" -- "${QFLAGS[@]}"
+fi
+
+RUN="$1"; shift
+ORIG_ARGS=("$@")
+MODEL=""; VIA=openrouter; EFFORT=high; MAXTURNS=300; PROMPT=""; RETRIES=3
+NETWORK=0; WALL_HOURS=""; DRY=0; CHECK=0; DETACH=0; QUEUED=""; MODULES=()
+APPROVAL_ARGS=()   # every argument except --dry-run, which never reaches the approval
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --via) VIA="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --effort) EFFORT="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --max-turns) MAXTURNS="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --budget) echo "run-external: --budget is removed: no run has a spending cap (LESSONS.md 'No spending cap on any run', user 2026-09-25)" >&2; exit 2;;
+    --prompt) PROMPT="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --retries) RETRIES="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --wall-hours) WALL_HOURS="$2"; APPROVAL_ARGS+=("$1" "$2"); shift 2;;
+    --network) NETWORK=1; APPROVAL_ARGS+=("$1"); shift;;
+    --module) MODULES+=("$2"); APPROVAL_ARGS+=("$1" "$2"); shift 2;;   # a licence module of kit-env.json (bin/_env.py)
+    --dry-run) DRY=1; shift;;
+    --check) DRY=1; CHECK=1; shift;;   # internal (a queue's pre-check): a dry run that also runs the host preflight
+    --queued) QUEUED="$2"; shift 2;;   # internal: released from a queue; never part of an approval
+    --detach) DETACH=1; shift;;
+    *) echo "run-external: unknown argument $1" >&2; usage;;
+  esac
+done
+[ -n "$MODEL" ] || { echo "run-external: --model is required" >&2; exit 2; }
+MODFLAGS=(); for m in "${MODULES[@]}"; do MODFLAGS+=(--module "$m"); done
+case "$VIA" in openrouter|anthropic|codex) ;; *) echo "run-external: --via must be openrouter, anthropic or codex" >&2; exit 2;; esac
+if [ -z "$WALL_HOURS" ]; then if [ "$VIA" = codex ]; then WALL_HOURS=2; else WALL_HOURS=4; fi; fi   # the per-route defaults
+[[ "$WALL_HOURS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "run-external: --wall-hours takes a number of hours" >&2; exit 2; }
+# Effort is checked here because Codex does not check it (it accepted "bogus" silently, 2026-09-22) and a typo would
+# otherwise run at an unknown effort. Lists: `claude --help`; the Codex binary's own enum (minimal ... max).
+if [ "$VIA" = codex ]; then EFFORTS="minimal low medium high xhigh max"; else EFFORTS="low medium high xhigh max"; fi
+case " $EFFORTS " in *" $EFFORT "*) ;; *) echo "run-external: --effort for --via $VIA must be one of: $EFFORTS" >&2; exit 2;; esac
+
+case "$RUN" in
+  /*) RD="$RUN";;
+  */*) RD="$ROOT/$RUN";;
+  *) RD=$(ls -d "$ROOT"/workspace-*/runs/"$RUN" 2>/dev/null | head -1 || true);;
+esac
+[ -n "${RD:-}" ] && [ -d "$RD" ] || { echo "run-external: run dir not found for $RUN" >&2; exit 2; }
+RD=$(realpath "$RD")
+case "$RD" in "$ROOT"/workspace-*/runs/*) ;; *) echo "run-external: $RD is not a run dir" >&2; exit 2;; esac
+[ -f "$RD/BRIEF.md" ] || { echo "run-external: $RD/BRIEF.md missing" >&2; exit 2; }
+NAME=$(basename "$RD")
+# P-12 (a low finding of the code audit): host state, approvals and bindings are keyed by the run's name, which bin/new-run
+# makes unique across workspaces; a second directory of the name (made by hand) would share them
+N_SAME=$(ls -d "$ROOT"/workspace-*/runs/"$NAME" 2>/dev/null | wc -l)
+[ "$N_SAME" -eq 1 ] || { echo "run-external: refused: the run name $NAME is not unique across workspaces ($N_SAME directories); host state, approvals and bindings are keyed by it" >&2; exit 2; }
+
+# LESSONS.md "A brief may not allow more tool calls than `--max-turns`" (the --max-turns default, run 081): a brief that promises the worker N tool calls ("at most N
+# tool calls", the skeleton's wording) needs a turn cap of at least N. Checked before the approval is touched, so
+# a refusal here spends nothing; the fix is to approve and launch with an explicit --max-turns.
+BRIEF_CALLS=$(grep -oiE 'at most [0-9]+ tool calls' "$RD/BRIEF.md" | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+if [ -n "$BRIEF_CALLS" ] && [ "$BRIEF_CALLS" -gt "$MAXTURNS" ]; then
+  echo "run-external: refused: BRIEF.md allows $BRIEF_CALLS tool calls but --max-turns is $MAXTURNS; pass --max-turns $BRIEF_CALLS or more (and approve that flag)" >&2
+  exit 2
+fi
+
+# LESSONS.md "Networked and Codex launches need their flags bound": an external route's harness note is part of what the worker sees, so it lives in the run
+# directory (bin/new-run --harness), where the approval binds its bytes; its marker line must match the flags.
+WANT_NOTE=""
+if [ "$VIA" = codex ]; then WANT_NOTE=codex; [ "$NETWORK" = 1 ] && WANT_NOTE=codex-net
+elif [ "$NETWORK" = 1 ]; then WANT_NOTE=claude-net; fi
+HAVE_NOTE=$(head -1 "$RD/HARNESS-NOTE.md" 2>/dev/null | grep -oE 'harness: [a-z-]+' | cut -d' ' -f2 || true)
+if [ "$WANT_NOTE" != "$HAVE_NOTE" ]; then
+  echo "run-external: refused: these flags need HARNESS-NOTE.md for route '${WANT_NOTE:-none}', the run has '${HAVE_NOTE:-none}' (bin/new-run --harness)" >&2
+  exit 2
+fi
+
+# LESSONS.md "A run directory is launched once": a run that holds an earlier launch's record (its transcript, logs,
+# RECORD-EXT.md) or an earlier worker's output is not launched again, since the new worker would read the previous attempt,
+# none of which the approval showed. Refused before the approval is touched; make a new run and keep this one as the record.
+# Every name the approval leaves unhashed (bin/_approval.py EXCLUDE_TOP) counts, so none can carry unapproved bytes to the
+# worker: licence.log, and the outbox once it holds anything (bin/new-run makes it empty) (P-12, a medium of the audit).
+PRIOR=$(find "$RD" -maxdepth 1 -type f \( -name 'launch*' -o -name 'RECORD-EXT*' -o -name 'egress*.log' -o -name 'gateway*.log' \
+          -o -name 'debug*.log' -o -name usage.json -o -name time.log -o -name licence.log \
+          -o \( -name .ledger-outbox -size +0 \) \) -printf '%f ' | sort)
+# an earlier worker's output counts too, whatever became of its logs (the source's stricter form, its method change 55)
+[ -d "$RD/output" ] && [ -n "$(find "$RD/output" -type f -print -quit)" ] && PRIOR="${PRIOR}output/ "
+if [ -n "$PRIOR" ]; then
+  echo "run-external: refused: $NAME was launched before (on file: $PRIOR); a new launch would show the worker that attempt." >&2
+  echo "  Make a new run (bin/new-run) with the same brief; this one stays as the record. Nothing was approved or spent." >&2
+  exit 2
+fi
+
+# A licence module (bin/_env.py) must be one of kit-env.json's, with a licence server: checked before the approval is touched.
+if [ ${#MODULES[@]} -gt 0 ]; then
+  env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_ext.py" module-check "${MODULES[@]}" \
+    || { echo "run-external: refused: --module ${MODULES[*]} (above); nothing was approved or spent" >&2; exit 2; }
+fi
+# bin/new-run --module recorded the run's licence modules in RUN/.modules, and its brief names them: the launch grants
+# exactly those, or the worker is promised a tool it does not have (or given one its brief never mentions).
+WANT_MODS=$([ -f "$RD/.modules" ] && grep -v '^\s*$' "$RD/.modules" | sort | tr '\n' ' ' || true)
+HAVE_MODS=$([ ${#MODULES[@]} -gt 0 ] && printf '%s\n' "${MODULES[@]}" | sort | tr '\n' ' ' || true)
+if [ "$WANT_MODS" != "$HAVE_MODS" ]; then
+  echo "run-external: refused: RUN/.modules names [${WANT_MODS% }] but the launch has --module [${HAVE_MODS% }]; nothing was approved or spent" >&2
+  exit 2
+fi
+
+# LESSONS.md "No packet carries blocked material": no packet carries what the instance's data/packet-rules.json rules out.
+# Checked before the approval is touched, so a refusal spends nothing; bin/lint-brief --packet RUN prints the findings.
+PKT_RC=0; PKT=$(env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/lint-brief" --packet "$RD" 2>&1) || PKT_RC=$?
+if [ "$PKT_RC" -ne 0 ]; then   # say which failure it was: a finding (1), or a scan that did not run (4)
+  echo "$PKT" >&2
+  if [ "$PKT_RC" -eq 1 ]; then
+    echo "run-external: refused: the packet carries blocked material (bin/lint-brief --packet $NAME)" >&2
+  else
+    echo "run-external: refused: the packet scan itself failed (exit $PKT_RC); nothing was checked, nothing launched" >&2
+  fi
+  exit 2
+fi
+if [ -n "$QUEUED" ] && [ "$DETACH" = 1 ]; then   # a queued run is detached by its queue, not alone
+  echo "run-external: --queued and --detach do not go together (use bin/run-external --queue … --detach)" >&2
+  exit 2
+fi
+
+# The host's own preconditions, checked before any approval is touched (the outside review's F7: they used to refuse after
+# the approval was spent, and a queue spent every approval before meeting them). The sandbox is a hook, and a hook only
+# runs because the project's settings register it: a tree whose settings file is missing (a kit copied by hand, a template
+# never filled) would launch a worker with no bwrap, no run-directory binding and no ledger, a launch that looks gated and
+# is not. A plain --dry-run does not run this (it works in any tree); --check, a queue's pre-check, does.
+preflight() {
+  local SETTINGS="$ROOT/.claude/settings.json" HOOKPATH="$ROOT/.claude/hooks/sandbox.py"
+  # P-11 (g): registered on PreToolUse for every tool and on PostToolUse, not merely named in the file
+  if [ ! -f "$SETTINGS" ] || ! env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_ext.py" hook-registered "$SETTINGS" "/usr/bin/python3 $HOOKPATH"; then
+    echo "run-external: refused: the worker sandbox is not installed in this tree, so this launch would not be" >&2
+    echo "  sandboxed, bound to its run directory or ledgered. $SETTINGS must exist and register $HOOKPATH on" >&2
+    echo "  PreToolUse/PostToolUse; fill .claude/settings.template.json (@ROOT@, @HOME@), or make the workspace with" >&2
+    echo "  bin/new-workspace. Nothing was approved or spent." >&2
+    return 1
+  fi
+  if [ "$NETWORK" = 1 ] && [ "$VIA" != codex ] && [ ! -f "$ROOT/.claude/worker-net.settings.json" ]; then
+    echo "run-external: refused: --network on a Claude route needs $ROOT/.claude/worker-net.settings.json" >&2
+    echo "  (fill .claude/worker-net.settings.template.json). Nothing was approved or spent." >&2
+    return 1
+  fi
+  if [ "$VIA" = codex ]; then   # LESSONS.md "A Codex worker has no sub-agents"
+    local PROBE_OUT
+    if ! PROBE_OUT=$(env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_ext.py" codex-probe "$RD" "$MODEL" "$EFFORT" \
+                       $([ "$NETWORK" = 1 ] && echo --network) 2>&1); then
+      echo "$PROBE_OUT" >&2
+      echo "run-external: refused: Codex, rendering this launch's prompt offline, still offers sub-agents or a disabled" >&2
+      echo "  feature (bin/_ext.py codex-probe). Nothing was approved or spent." >&2
+      return 1
+    fi
+  fi
+  if ! "$ROOT/bin/limits-exec" --probe; then   # P-3 B3: limits are enforced, not promised (RULES.md §9)
+    echo "run-external: refused: this host cannot enforce the run's limits (no systemd user manager). Nothing was approved or spent." >&2
+    return 1
+  fi
+  if [ "$VIA" = openrouter ]; then
+    [ -r "$KEYFILE" ] || { echo "run-external: refused: key file $KEYFILE not readable. Nothing was approved or spent." >&2; return 1; }
+    [ -n "$(tr -d '[:space:]' < "$KEYFILE")" ] || { echo "run-external: refused: key file is empty. Nothing was approved or spent." >&2; return 1; }
+  fi
+  return 0
+}
+
+if [ "$DRY" = 1 ]; then   # prints what would run; touches no approval, starts nothing
+  if [ "$CHECK" = 1 ]; then preflight || exit 2; fi
+  echo "run-external: DRY RUN of $NAME: via=$VIA network=$NETWORK model=$MODEL effort=$EFFORT wall-hours=$WALL_HOURS; approval flags: ${APPROVAL_ARGS[*]}"
+  if [ "$VIA" = codex ]; then
+    exec /usr/bin/python3 "$ROOT/bin/_ext.py" codex "$RD" --model "$MODEL" --effort "$EFFORT" --wall-hours "$WALL_HOURS" --max-turns "$MAXTURNS" \
+      ${PROMPT:+--prompt "$PROMPT"} $([ "$NETWORK" = 1 ] && echo --network) "${MODFLAGS[@]}" --dry-run
+  fi
+  echo "claude flags: --model $MODEL --effort $EFFORT --max-turns $MAXTURNS (under timeout: wall-clock cap ${WALL_HOURS} h)$([ "$NETWORK" = 1 ] && echo ' --tools Read,Write,Bash,WebSearch,WebFetch --settings .claude/worker-net.settings.json --setting-sources local --disable-slash-commands --append-system-prompt <HARNESS-NOTE.md>' || echo ' --agent kit-worker --tools Read,Write,Bash --setting-sources project,local --disable-slash-commands'); env: CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1"
+  exit 0
+fi
+
+preflight || exit 2   # before a detach and before the approval: a refusal here spends nothing
+
+if [ "$DETACH" = 1 ]; then
+  # Re-run this launcher, without --detach, as a transient user service; everything below happens inside it.
+  UNIT="kit-run-$NAME"; SD="$ROOT/.claude/state/ext/$NAME"; mkdir -p "$SD"
+  OUT="$SD/detached.out"; EXITF="$SD/detached.exit"
+  # P-12: asked before anything is touched, so a second launch never empties a running one's output
+  if systemctl --user is-active --quiet "$UNIT"; then echo "run-external: $UNIT is already running" >&2; exit 2; fi
+  rm -f "$EXITF"; : > "$OUT"
+  systemd-run --user --unit="$UNIT" --collect --quiet --working-directory="$ROOT" \
+    --setenv=PATH="$PATH" --setenv=HOME="$HOME" ${OPENROUTER_KEYFILE:+--setenv=OPENROUTER_KEYFILE="$OPENROUTER_KEYFILE"} \
+    -p StandardOutput="append:$OUT" -p StandardError="append:$OUT" \
+    /bin/bash -c 'f=$1; shift; "$@"; echo $? > "$f"' run-external "$EXITF" "$0" "$RUN" "${APPROVAL_ARGS[@]}" \
+    || { echo "run-external: systemd-run failed; nothing launched" >&2; exit 1; }
+  for _ in $(seq 40); do [ -s "$EXITF" ] && break; sleep 0.25; done   # an early refusal shows within seconds
+  if [ -s "$EXITF" ]; then
+    RC=$(cat "$EXITF"); cat "$OUT" >&2
+    echo "run-external: the detached launch of $NAME ended at once with exit $RC" >&2
+    exit "$RC"
+  fi
+  echo "run-external: $NAME detached as user service $UNIT"
+  echo "  watch:  bin/watch-run $NAME -f        output: $OUT"
+  echo "  status: systemctl --user status $UNIT   stop: systemctl --user stop $UNIT"
+  exit 0
+fi
+
+# LESSONS.md "Every launch and every ledger append consumes a byte-bound": refuse unless the user approved exactly these bytes (and these flags, if the
+# approval recorded flags). The approval is single-use and is consumed here, before anything launches.
+# LESSONS.md "Networked and Codex launches need their flags bound": a networked or Codex launch needs its flags bound in the approval.
+REQ=(); { [ "$VIA" = codex ] || [ "$NETWORK" = 1 ] || [ ${#MODULES[@]} -gt 0 ]; } && REQ=(--require-flags)
+if [ -n "$QUEUED" ]; then   # the approval was used when the queue started; release this run from it
+  APPROVAL=$(env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_approval.py" queued "$QUEUED" "$RD" -- "${APPROVAL_ARGS[@]}") || exit 3
+else
+  APPROVAL=$(env -u KIT_ROOT /usr/bin/python3 "$ROOT/bin/_approval.py" check launch "$RD" "${REQ[@]}" -- "${APPROVAL_ARGS[@]}") || exit 3
+fi
+# P-11 (c): from here the hook reads the run's limits from this copy of the approved bytes, where no worker writes (the
+# run's own .limits is the worker's to rewrite); the re-read of the bytes before the start confirms they are these
+KEEP="$ROOT/.claude/state/ext/$NAME"; mkdir -p "$KEEP"
+cp "$RD/.limits" "$KEEP/limits.json" \
+  || { echo "run-external: refused: the run's limits could not be kept outside it; the approval is used, nothing launched" >&2; exit 1; }
+
+ROUTE_ENV=()
+if [ "$VIA" = openrouter ]; then
+  KEY=$(tr -d '[:space:]' < "$KEYFILE")   # readable and non-empty: preflight
+  ROUTE_ENV=(ANTHROPIC_BASE_URL="https://openrouter.ai/api" ANTHROPIC_AUTH_TOKEN="$KEY" ANTHROPIC_API_KEY=""
+             CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 CLAUDE_CODE_ATTRIBUTION_HEADER=0)
+fi
+
+USER_PROMPT="$PROMPT"
+[ -n "$PROMPT" ] || PROMPT="Start by reading $RD/BRIEF.md with the Read tool, then follow it exactly. Your run directory is $RD."
+RESUME_PROMPT="The previous API call failed upstream (provider rate limit), not because of anything you did. Continue exactly where you left off: do not repeat work already done, and finish the brief."
+
+rotate_logs() {   # $1: the host-side log dir on a retry (a run directory is launched once; see above)
+  local d="$1" ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+  for f in launch.log launch.err debug.log launch.jsonl launch.last.md RECORD-EXT.md gateway.log egress.log; do
+    if [ -e "$d/$f" ]; then mv "$d/$f" "$d/${f%.*}.$ts.${f##*.}"; fi
+  done
+  return 0
+}
+
+# Nested-launch support: drop every variable the parent Claude Code session set, and every ANTHROPIC_* one it inherited:
+# a parent routed elsewhere (ANTHROPIC_BASE_URL, a token, a model override) would otherwise route the worker too (the
+# source's caveat of 2026-09-16). The OpenRouter route sets its own in ROUTE_ENV, on the worker's command line.
+for v in $(env | grep -oE '^(CLAUDE|ANTHROPIC_)[A-Z0-9_]*' | sort -u); do unset "$v"; done
+
+LOGDIR="$ROOT/.claude/state/ext/$NAME/logs"; mkdir -p "$LOGDIR"; rm -f "$LOGDIR"/*
+# -T: a link the worker left at the name is replaced, never followed into (P-12 C2)
+move_logs() { for f in "$LOGDIR"/*; do [ -e "$f" ] && mv -T "$f" "$RD/$(basename "$f")"; done; return 0; }
+"$ROOT/bin/ledger" -r "$NAME" LAUNCH-EXT "run-external: model=$MODEL via=$VIA network=$NETWORK modules=$(IFS=,; echo "${MODULES[*]:-none}") effort=$EFFORT max-turns=$MAXTURNS wall-hours=$WALL_HOURS retries=$RETRIES approval=$APPROVAL"
+T0=$(date +%s)
+cd "$ROOT"
+PY=/usr/bin/python3   # the sandbox's and the hook's Python, not the shell's
+NETFLAG=(); [ "$NETWORK" = 1 ] && NETFLAG=(--network)
+# The Claude Code CLI: kit-env.json's "claude" (bin/_env.py), by name on PATH or an absolute path; default `claude`.
+CLAUDE_BIN=$(env -u KIT_ROOT "$PY" "$ROOT/bin/_ext.py" cli claude 2>/dev/null || echo claude)
+
+ATTEMPT=0; SID=""; RC=0; WALL_HIT=0; TURN_HIT=0
+DEADLINE=$(/usr/bin/python3 -c "import sys; print(int(float(sys.argv[1]) + float(sys.argv[2]) * 3600))" "$T0" "$WALL_HOURS")
+if [ "$VIA" = codex ]; then
+  # LESSONS.md "Networked and Codex launches need their flags bound": the whole codex process inside bwrap, under the run's enforced limits; no retry loop
+  # (Codex retries upstream errors itself); the wall-clock cap is enforced by _ext.py.
+  PARG=(); [ -n "$USER_PROMPT" ] && PARG=(--prompt "$USER_PROMPT")
+  set +e
+  "$ROOT/bin/limits-exec" "$RD" -- "$PY" "$ROOT/bin/_ext.py" codex "$RD" --model "$MODEL" --effort "$EFFORT" \
+    --wall-hours "$WALL_HOURS" --max-turns "$MAXTURNS" "${NETFLAG[@]}" "${MODFLAGS[@]}" "${PARG[@]}" --approval "$APPROVAL"
+  RC=$?
+  set -e
+  [ $RC -eq 124 ] && WALL_HIT=1   # _ext.py returns 124 when it stopped the worker at the wall cap
+  [ $RC -eq 125 ] && TURN_HIT=1   # and 125 at the tool-call cap
+  # 152: bin/limits-exec stopped it at the run's CPU budget (cpu_cap_hit= on EXIT-EXT, from usage.json)
+else
+# LESSONS.md "Networked and Codex launches need their flags bound": a networked Claude worker. The key-holding search gateway runs here, outside every sandbox;
+# the hook sees KIT_WORKER_NET=1 and gives the worker WebSearch/WebFetch and a Bash sandbox that shares the
+# network. The project settings deny web tools to everyone, so this worker loads its own settings file (the same
+# hook, no web denial) and no project settings; its rules come from the harness note, not the agent file.
+MODE_ARGS=(--agent kit-worker --tools Read,Write,Bash --setting-sources project,local --disable-slash-commands)
+NET_ENV=()
+# User 2026-09-22 14:14: no run method shows memory or skills. Canary 098's start-up record listed 18 skills and an
+# auto-memory path, as runs 081 and 086 had; --disable-slash-commands drops every skill, the two variables drop
+# auto memory and the bundled skills (belt and braces), for both Claude routes.
+WORKER_ENV=(CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_DISABLE_BUNDLED_SKILLS=1)
+if [ "$NETWORK" = 1 ]; then
+  SD="$ROOT/.claude/state/ext/$NAME"; mkdir -p "$SD"; PF="$SD/gateway.url"; rm -f "$PF"
+  "$PY" "$ROOT/bin/_ext.py" gateway "$SD" "$PF" & GW_PID=$!
+  trap 'kill "$GW_PID" 2>/dev/null || true' EXIT
+  for _ in $(seq 100); do [ -s "$PF" ] && break; sleep 0.1; done
+  GATEWAY=$(cat "$PF" 2>/dev/null || true)
+  [ -n "$GATEWAY" ] || { echo "run-external: the search gateway did not start" >&2; exit 1; }
+  NET_ENV=(KIT_WORKER_NET=1 KIT_NET_GATEWAY="$GATEWAY" SEARXNG_URL=http://localhost:7764)
+  MODE_ARGS=(--tools Read,Write,Bash,WebSearch,WebFetch --settings "$ROOT/.claude/worker-net.settings.json"
+             --setting-sources local --disable-slash-commands --append-system-prompt "$(cat "$RD/HARNESS-NOTE.md")")
+fi
+# A licence module (bin/_env.py): the hook mounts it for this worker, told by KIT_WORKER_MODULES in the worker's own process
+# environment, and on a run without the network the relay here carries its connections to the licence servers only.
+LIC_ENV=()
+if [ ${#MODULES[@]} -gt 0 ]; then
+  LIC_ENV=(KIT_WORKER_MODULES="$(IFS=,; echo "${MODULES[*]}")")
+  if [ "$NETWORK" != 1 ]; then
+    LSD="$ROOT/.claude/state/ext/$NAME"; mkdir -p "$LSD"; LF="$LSD/licence.socks"; rm -f "$LF"
+    env -u KIT_ROOT "$PY" "$ROOT/bin/_ext.py" licence-relay "$RD" "$LF" "${MODULES[@]}" & LIC_PID=$!
+    trap 'kill "$LIC_PID" 2>/dev/null || true' EXIT
+    for _ in $(seq 100); do [ -s "$LF" ] && break; sleep 0.1; done
+    [ -s "$LF" ] || { echo "run-external: the licence relay did not start; the approval is used, nothing launched" >&2; exit 1; }
+    LIC_ENV+=(KIT_WORKER_LICENCE_SOCKS="$(cat "$LF")")
+  fi
+fi
+while :; do
+  REMAIN=$((DEADLINE - $(date +%s)))   # one deadline for the whole launch, retries included
+  if [ "$REMAIN" -le 0 ]; then RC=124; WALL_HIT=1; break; fi
+  if [ -n "$SID" ]; then RESUME=(--resume "$SID"); P="$RESUME_PROMPT"; else RESUME=(); P="$PROMPT"; fi
+  # P-12 (a medium of the code audit): the approval was used before the set-up above; the bytes are read again against
+  # it just before the first worker starts (a retry's run holds the worker's own writes by then)
+  if [ "$ATTEMPT" -eq 0 ] && ! env -u KIT_ROOT "$PY" "$ROOT/bin/_approval.py" verify launch "$RD" "$APPROVAL"; then
+    "$ROOT/bin/ledger" -r "$NAME" REFUSED-EXT "run-external: the run's bytes changed after its approval was used; nothing launched"
+    exit 3
+  fi
+  set +e
+  env \
+    KIT_WORKER_RUN="$RD" \
+    "${ROUTE_ENV[@]}" "${NET_ENV[@]}" "${LIC_ENV[@]}" "${WORKER_ENV[@]}" \
+    "$ROOT/bin/limits-exec" "$RD" -- \
+    timeout --kill-after=60 "$REMAIN" \
+    "$CLAUDE_BIN" -p "$P" "${RESUME[@]}" \
+      --model "$MODEL" --effort "$EFFORT" \
+      "${MODE_ARGS[@]}" \
+      --strict-mcp-config --mcp-config "$ROOT/.claude/no-mcp.json" \
+      --max-turns "$MAXTURNS" \
+      --output-format stream-json --verbose \
+      ${RUN_EXTERNAL_DEBUG:+--debug api --debug-file "$LOGDIR/debug.log"} \
+      < /dev/null > "$LOGDIR/launch.log" 2> "$LOGDIR/launch.err"
+  RC=$?
+  set -e
+  [ $RC -eq 0 ] && break
+  [ $RC -eq 152 ] && break   # bin/limits-exec stopped it at the run's CPU budget: never retried
+  # `timeout` stopped it at the wall-clock cap: 124, or 137 only when the deadline has passed (a KILL by the memory cap
+  # or by the user also gives 137)
+  if [ $RC -eq 124 ] || { [ $RC -eq 137 ] && [ "$(date +%s)" -ge "$DEADLINE" ]; }; then WALL_HIT=1; break; fi
+  [ $ATTEMPT -lt "$RETRIES" ] || break
+  # upstream rate limit surfaced as a malformed HTTP 200?
+  # (P-12 H4: the CLI's own words only, never the worker's tool output or text)
+  if ! "$PY" "$ROOT/bin/_ext.py" upstream-limited "$LOGDIR/launch.log" "$LOGDIR/launch.err"; then break; fi
+  # session id and whether the worker got anywhere
+  INFO=$(/usr/bin/python3 - "$LOGDIR/launch.log" <<'EOF'
+import json,sys
+sid=""; used=0
+for line in open(sys.argv[1]):
+    try: e=json.loads(line)
+    except: continue
+    if e.get('type')=='system' and e.get('subtype')=='init': sid=e.get('session_id','')
+    if e.get('type')=='assistant':
+        for c in (e.get('message') or {}).get('content') or []:
+            if c.get('type')=='tool_use': used+=1
+print(sid, used)
+EOF
+)
+  NEWSID=${INFO%% *}; USED=${INFO##* }
+  if [ "$USED" -gt 0 ] && [ -n "$NEWSID" ]; then SID="$NEWSID"; MODE="resume $SID"; else SID=""; MODE="fresh"; fi
+  ATTEMPT=$((ATTEMPT+1)); WAIT=$((30 * (1 << (ATTEMPT-1))))
+  "$ROOT/bin/ledger" -r "$NAME" RETRY-EXT "run-external: attempt $ATTEMPT/$RETRIES after upstream rate limit (exit=$RC, $USED tool calls so far); waiting ${WAIT}s then $MODE"
+  echo "run-external: $NAME upstream rate limit; retry $ATTEMPT/$RETRIES in ${WAIT}s ($MODE)"
+  sleep "$WAIT"
+  rotate_logs "$LOGDIR"
+done
+fi
+move_logs   # the transcript enters the run directory only once the worker has stopped
+# P-12 C3: a session file under the Codex record's name, on another route, is the worker's, not the record
+[ "$VIA" != codex ] && rm -f "$RD"/launch.rollout*.jsonl
+# LESSONS.md "Networked and Codex launches need their flags bound": every external route with a network or outside the Claude hook leaves RUN/RECORD-EXT.md.
+if [ "$VIA" = codex ] || [ "$NETWORK" = 1 ]; then
+  "$PY" "$ROOT/bin/_ext.py" record "$RD" --via "$VIA" --model "$MODEL" "${NETFLAG[@]}" --exit "$RC" || true
+fi
+T1=$(date +%s)
+[ "$VIA" != codex ] && grep -q '"subtype":"error_max_turns"' "$RD/launch.log" 2>/dev/null && TURN_HIT=1
+# LESSONS.md "The model a worker ran on is recorded": the models that answered, and whether it was one (a refusal can
+# hand the session to another model under an approval that named the first).
+[ -n "${LSD:-}" ] && [ -f "$LSD/licence.log" ] && "$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import _lib as L
+L.write_in_run(sys.argv[2], "licence.log", open(sys.argv[3], "rb").read())' "$ROOT/bin" "$RD" "$LSD/licence.log"   # every licence connection, kept (P-12 C2: never through a link)
+MODELS=$("$PY" "$ROOT/bin/_ext.py" models "$RD" "$MODEL" 2>/dev/null || echo "unknown unknown")
+MODELS_SEEN=$(echo "$MODELS" | cut -d' ' -f1); FALLBACK=$(echo "$MODELS" | cut -d' ' -f2); WHY=$(echo "$MODELS" | cut -d' ' -f3-)
+USAGE=$(/usr/bin/python3 -c "
+import json,sys
+try: u=json.load(open(sys.argv[1]))
+except Exception: print('cpu=? (no usage.json)'); sys.exit()
+print('cpu=%ss (%s; last attempt only) cpu_hours=%s/%s cap threads_cap=%s mem_cap=%sG peak_rss_tree=%sMB enforced=%s over_cpu_cap=%s' % (
+  u.get('cpu_seconds','?'), u.get('cpu_source','?'), u.get('cpu_hours','?'), u.get('cpu_hours_cap','?'), u.get('threads_cap','?'),
+  u.get('mem_gb_cap','?'), (u.get('peak_rss_kb_tree') or 0)//1024, u.get('enforced'), u.get('over_cpu_cap'))
+  + ' cpu_cap_hit=%s' % u.get('cpu_cap_hit', False))" "$RD/usage.json")
+EFFORT_SEEN=$("$PY" "$ROOT/bin/_ext.py" effort "$RD" "$VIA" 2>/dev/null || echo unknown)   # item 5: what the requests carried
+PLAN="n/a"   # the ChatGPT plan's usage limit, which only Codex's own log shows
+[ "$VIA" = codex ] && PLAN=$("$PY" "$ROOT/bin/_ext.py" planlimit "$RD" 2>/dev/null || echo unknown)
+CAPACITY="n/a"   # the provider refused to start the run: the model is at capacity (Codex's own log shows it)
+[ "$VIA" = codex ] && CAPACITY=$("$PY" "$ROOT/bin/_ext.py" capacity "$RD" 2>/dev/null || echo unknown)
+"$ROOT/bin/ledger" -r "$NAME" EXIT-EXT "run-external: exit=$RC wall=$((T1-T0))s attempts=$((ATTEMPT+1)) model=$MODEL via=$VIA effort=$EFFORT effort_seen=$EFFORT_SEEN models_seen=$MODELS_SEEN model_fallback=$FALLBACK wall_cap_hit=$WALL_HIT turn_cap_hit=$TURN_HIT plan_limit=${PLAN%% *} at_capacity=$CAPACITY $USAGE"
+[ "$FALLBACK" = yes ] && echo "run-external: WARNING: $NAME was not answered by one model: $WHY. The approval named --model $MODEL; bin/close-run and bin/ledger-claims will say so." >&2
+case "$PLAN" in hit*) echo "run-external: WARNING: the ChatGPT plan's usage limit ended this run: $PLAN" >&2;; esac
+[ "$CAPACITY" = yes ] && echo "run-external: WARNING: the model was at capacity and the provider refused to start this run; nothing ran, the approval was spent. Retry later as a new run (a run directory is launched once)." >&2
+echo "run-external: $NAME exit=$RC wall=$((T1-T0))s attempts=$((ATTEMPT+1)) log=$RD/$([ "$VIA" = codex ] && echo launch.jsonl || echo launch.log)"
+echo "run-external: $USAGE"
+echo "run-external: effort requested=$EFFORT, carried by the model's requests: $EFFORT_SEEN"
+echo "run-external: model requested=$MODEL, answered by: $MODELS_SEEN"
+exit $RC

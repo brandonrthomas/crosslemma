@@ -1,0 +1,91 @@
+#!/usr/bin/python3
+"""bin/handoff-archive [--session NAME] [--quiet]
+
+Copies the current HANDOFF.md to handoffs/YYYY-MM-DD-HHMM-<git short sha|uncommitted>-<session>.md
+so that no rewrite of the handoff ever loses the previous version (LESSONS.md "`HANDOFF.md` is archived before it is touched", user direction
+2026-09-16 20:55 MST). Rules:
+  - never overwrites: an existing target name is an error;
+  - idempotent by content: if any archive already has the same sha256 as HANDOFF.md, nothing is
+    written and that file is named (exit 0), so the hook may call this on every touch;
+  - <sha> is the short HEAD sha when HANDOFF.md is unchanged from HEAD, else 'uncommitted';
+  - <session> is --session, else $KIT_SESSION, else 'unknown'. Local time in the name, as the
+    seeded archives use.
+The sandbox hook runs this before the first Write/Edit/Bash of an orchestrator session that touches
+HANDOFF.md. Run it by hand before rewriting the handoff if you want a named session in the file.
+"""
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = os.path.realpath(os.environ.get("KIT_ROOT", os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+HANDOFF = os.path.join(ROOT, "HANDOFF.md")
+ARCHIVE = os.path.join(ROOT, "handoffs")
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git_state():
+    """Short HEAD sha if HANDOFF.md is identical to HEAD's copy, else 'uncommitted'."""
+    try:
+        sha = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        clean = subprocess.run(["git", "-C", ROOT, "diff", "--quiet", "HEAD", "--", "HANDOFF.md"]).returncode == 0
+        tracked = subprocess.run(["git", "-C", ROOT, "ls-files", "--error-unmatch", "HANDOFF.md"], capture_output=True).returncode == 0
+        return sha if (clean and tracked) else "uncommitted"
+    except Exception:
+        return "uncommitted"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--session", default=os.environ.get("KIT_SESSION") or "unknown")
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    if not os.path.isfile(HANDOFF):
+        print(f"handoff-archive: no {HANDOFF}", file=sys.stderr)
+        sys.exit(2)
+    if not os.path.isfile(os.path.join(ROOT, "LEDGER.log")):
+        # LESSONS.md "A session works on the tree it was opened in": archive only in an instance, never create its ledger
+        print(f"handoff-archive: no LEDGER.log at {ROOT}: this tree is not an instance (the kit, or a command run in the "
+              "wrong directory); nothing archived", file=sys.stderr)
+        sys.exit(2)
+    os.makedirs(ARCHIVE, exist_ok=True)
+    want = sha256(HANDOFF)
+    for f in sorted(os.listdir(ARCHIVE)):
+        p = os.path.join(ARCHIVE, f)
+        if f.endswith(".md") and os.path.isfile(p) and sha256(p) == want:
+            if not a.quiet:
+                print(f"already archived: handoffs/{f}")
+            sys.exit(0)
+    session = re.sub(r"[^A-Za-z0-9_.-]+", "-", a.session).strip("-") or "unknown"
+    name = f"{time.strftime('%Y-%m-%d-%H%M')}-{git_state()}-{session}.md"
+    dst = os.path.join(ARCHIVE, name)
+    if os.path.exists(dst):
+        print(f"handoff-archive: refusing to overwrite handoffs/{name}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        shutil.copyfile(HANDOFF, dst)
+    except OSError as e:
+        print(f"handoff-archive: cannot write handoffs/{name}: {e.strerror or e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        with open(os.path.join(ROOT, "LEDGER.log"), "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} | orchestrator | - | HANDOFF-ARCHIVE | handoffs/{name} sha256={want}\n")
+    except OSError as e:   # the archive is made; say that its ledger line is not (P-12: no silent failure)
+        print(f"handoff-archive: archived, but LEDGER.log was not written: {e.strerror or e}", file=sys.stderr)
+    if not a.quiet:
+        print(f"archived: handoffs/{name}")
+
+
+if __name__ == "__main__":
+    main()

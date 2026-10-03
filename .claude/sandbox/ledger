@@ -1,0 +1,5 @@
+#!/bin/sh
+# Inside the sandbox: queue one ledger entry. The host hook moves queued entries into the project ledger.
+[ -n "$*" ] || { echo "usage: ledger \"message\"" >&2; exit 1; }
+printf '%s\n' "$(printf '%s' "$*" | tr '\n\r' '  ')" >> "$KIT_RUN/.ledger-outbox"
+echo "[ledger] entry queued"

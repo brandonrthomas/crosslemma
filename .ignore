@@ -1,0 +1,7 @@
+# Read by ripgrep (and so by Claude Code's Grep tool) and fd: an instance's ledger, its locked data and its approval
+# records are skipped by a search from the root (pending item P-9, the interim fix, 2026-10-01). Not a guard: `grep -r`,
+# `find` and `rg --no-ignore` do not read this file; the hook (RULES.md §9) and the rule (§4, the never-read list) do the
+# guarding. Copied into every instance by bin/new-workspace. The kit itself has none of these paths.
+/LEDGER.log
+/data/locked/
+/.claude/state/approvals/
